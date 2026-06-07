@@ -2,6 +2,8 @@
 package session
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -123,6 +125,130 @@ func (s *StateStore) Delete(id, kind string) error {
 	path := s.keyPath(id, kind)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete state: %w", err)
+	}
+	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MemorySessionStorage — ported from Telethon-MCUB; useful for testing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// MemorySessionStorage stores a gotd session entirely in memory.
+// It is lost when the process exits — use it for tests or ephemeral sessions.
+type MemorySessionStorage struct {
+	mu   sync.RWMutex
+	data []byte
+}
+
+// NewMemorySessionStorage creates an empty in-memory session storage.
+func NewMemorySessionStorage() *MemorySessionStorage {
+	return &MemorySessionStorage{}
+}
+
+// Storage returns the MemorySessionStorage itself as a session.Storage.
+func (m *MemorySessionStorage) Storage() session.Storage {
+	return m
+}
+
+// LoadSession implements session.Storage.
+func (m *MemorySessionStorage) LoadSession(_ context.Context) ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.data) == 0 {
+		return nil, nil
+	}
+	out := make([]byte, len(m.data))
+	copy(out, m.data)
+	return out, nil
+}
+
+// StoreSession implements session.Storage.
+func (m *MemorySessionStorage) StoreSession(_ context.Context, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data = make([]byte, len(data))
+	copy(m.data, data)
+	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SQLiteSessionStorage — persists the session in a SQLite database.
+// The caller must blank-import a SQLite3 driver, e.g.:
+//
+//	import _ "github.com/mattn/go-sqlite3"
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+const sqliteSchema = `
+CREATE TABLE IF NOT EXISTS mcub_session (
+    id   INTEGER PRIMARY KEY,
+    data BLOB    NOT NULL
+);
+`
+
+const sqliteKey = 1
+
+// SQLiteSessionStorage persists a gotd session in a SQLite database.
+type SQLiteSessionStorage struct {
+	path string
+	db   *sql.DB
+}
+
+// NewSQLiteSessionStorage opens (or creates) the SQLite database at path and
+// initialises the session table.  The caller must have imported a SQLite driver
+// (e.g. github.com/mattn/go-sqlite3) before calling this function.
+func NewSQLiteSessionStorage(path string) (*SQLiteSessionStorage, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create db dir: %w", err)
+	}
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite3: %w", err)
+	}
+
+	if _, err := db.Exec(sqliteSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("init schema: %w", err)
+	}
+
+	return &SQLiteSessionStorage{path: path, db: db}, nil
+}
+
+// Storage returns the SQLiteSessionStorage itself as a session.Storage.
+func (s *SQLiteSessionStorage) Storage() session.Storage {
+	return s
+}
+
+// Close closes the underlying database connection.
+func (s *SQLiteSessionStorage) Close() error {
+	return s.db.Close()
+}
+
+// LoadSession implements session.Storage.
+func (s *SQLiteSessionStorage) LoadSession(ctx context.Context) ([]byte, error) {
+	var data []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT data FROM mcub_session WHERE id = ?`, sqliteKey,
+	).Scan(&data)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load session: %w", err)
+	}
+	return data, nil
+}
+
+// StoreSession implements session.Storage.
+func (s *SQLiteSessionStorage) StoreSession(ctx context.Context, data []byte) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO mcub_session (id, data) VALUES (?, ?)
+		 ON CONFLICT(id) DO UPDATE SET data = excluded.data`,
+		sqliteKey, data,
+	)
+	if err != nil {
+		return fmt.Errorf("store session: %w", err)
 	}
 	return nil
 }

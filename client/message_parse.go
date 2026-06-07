@@ -58,11 +58,21 @@ func UnparseText(text string, entities []tg.MessageEntityClass, parseMode string
 // HTMLToEntities converts HTML-formatted text to plain text + entity list.
 // Supported tags: <b>, <strong>, <i>, <em>, <u>, <ins>, <s>, <strike>,
 // <del>, <code>, <pre>, <a href="...">.
+// utf16RuneLen returns the number of UTF-16 code units needed to represent rune r.
+// Most characters take 1 unit; characters above U+FFFF use a surrogate pair (2 units).
+func utf16RuneLen(r rune) int {
+	if r >= 0x10000 {
+		return 2
+	}
+	return 1
+}
+
 func HTMLToEntities(html string) (string, []tg.MessageEntityClass, error) {
 	var (
 		out      strings.Builder
 		entities []tg.MessageEntityClass
 		stack    []htmlTag // open-tag stack for nesting
+		utf16Pos int       // UTF-16 code-unit offset into out
 	)
 
 	i := 0
@@ -73,6 +83,7 @@ func HTMLToEntities(html string) (string, []tg.MessageEntityClass, error) {
 		ch := runes[i]
 		if ch != '<' {
 			out.WriteRune(ch)
+			utf16Pos += utf16RuneLen(ch)
 			i++
 			continue
 		}
@@ -85,6 +96,7 @@ func HTMLToEntities(html string) (string, []tg.MessageEntityClass, error) {
 		if end >= n {
 			// Unclosed tag — treat literally.
 			out.WriteRune(ch)
+			utf16Pos += utf16RuneLen(ch)
 			i++
 			continue
 		}
@@ -98,7 +110,7 @@ func HTMLToEntities(html string) (string, []tg.MessageEntityClass, error) {
 			// Pop matching open tag.
 			for j := len(stack) - 1; j >= 0; j-- {
 				if stack[j].name == name || tagAlias(stack[j].name) == name {
-					ent := buildHTMLEntity(stack[j], out.Len())
+					ent := buildHTMLEntity(stack[j], utf16Pos)
 					if ent != nil {
 						entities = append(entities, ent)
 					}
@@ -119,14 +131,15 @@ func HTMLToEntities(html string) (string, []tg.MessageEntityClass, error) {
 
 		switch tagName {
 		case "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre",
-			"a", "spoiler", "tg-spoiler":
+			"a", "spoiler", "tg-spoiler", "blockquote", "tg-emoji":
 			stack = append(stack, htmlTag{
-				name:   tagName,
-				start:  out.Len(),
-				attrs:  attrs,
+				name:  tagName,
+				start: utf16Pos,
+				attrs: attrs,
 			})
 		case "br":
 			out.WriteByte('\n')
+			utf16Pos++
 		}
 	}
 
@@ -428,6 +441,21 @@ func buildHTMLEntity(tag htmlTag, end int) tg.MessageEntityClass {
 		return &tg.MessageEntityTextURL{Offset: tag.start, Length: length, URL: href}
 	case "spoiler", "tg-spoiler":
 		return &tg.MessageEntitySpoiler{Offset: tag.start, Length: length}
+	case "blockquote":
+		return &tg.MessageEntityBlockquote{Offset: tag.start, Length: length}
+	case "tg-emoji":
+		emojiIDStr := tag.attrs["emoji-id"]
+		if emojiIDStr == "" {
+			return nil
+		}
+		var docID int64
+		for _, ch := range emojiIDStr {
+			if ch < '0' || ch > '9' {
+				return nil
+			}
+			docID = docID*10 + int64(ch-'0')
+		}
+		return &tg.MessageEntityCustomEmoji{Offset: tag.start, Length: length, DocumentID: docID}
 	}
 	return nil
 }
@@ -507,6 +535,11 @@ func entityToHTMLTags(ent tg.MessageEntityClass) (open, close string, ok bool) {
 		return fmt.Sprintf(`<a href="%s">`, escapeHTML(e.URL)), "</a>", true
 	case *tg.MessageEntitySpoiler:
 		return `<tg-spoiler>`, `</tg-spoiler>`, true
+	case *tg.MessageEntityBlockquote:
+		return `<blockquote>`, `</blockquote>`, true
+	case *tg.MessageEntityCustomEmoji:
+		e := ent.(*tg.MessageEntityCustomEmoji)
+		return fmt.Sprintf(`<tg-emoji emoji-id="%d">`, e.DocumentID), `</tg-emoji>`, true
 	}
 	return "", "", false
 }
