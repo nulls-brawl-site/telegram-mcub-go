@@ -161,12 +161,17 @@ func (c *MCUBClient) GetMembers(ctx context.Context, chatID int64, limit int) ([
 // resolveInputChannel converts a packed channel peer ID to an InputChannel.
 func (c *MCUBClient) resolveInputChannel(ctx context.Context, chatID int64) (*tg.InputChannel, error) {
 	_ = ctx
+	// Accept packed peer IDs (-(channel_id + 1_000_000_000_000)) and raw positive channel IDs.
 	if chatID < -999999999 {
-		return &tg.InputChannel{ChannelID: channelIDFromPeerID(chatID)}, nil
+		return &tg.InputChannel{ChannelID: channelIDFromPeerID(chatID), AccessHash: 0}, nil
+	}
+	if chatID > 0 {
+		// Raw channel ID supplied directly.
+		return &tg.InputChannel{ChannelID: chatID, AccessHash: 0}, nil
 	}
 	if chatID < 0 {
-		// Regular group — not a channel; return an error or a zero channel for callers that need one.
-		return nil, fmt.Errorf("chat ID %d is not a channel/supergroup", chatID)
+		// Regular basic group — not a channel.
+		return nil, fmt.Errorf("chat ID %d is a basic group, not a channel/supergroup", chatID)
 	}
 	return nil, fmt.Errorf("invalid channel ID %d", chatID)
 }

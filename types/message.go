@@ -1,6 +1,9 @@
 package types
 
 import (
+	"bytes"
+	"context"
+	"fmt"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -338,8 +341,8 @@ func (m *MCUBMessage) IsForwarded() bool {
 	return ok
 }
 
-// ForwardedFrom returns the sender ID of the original message, or 0.
-func (m *MCUBMessage) ForwardedFrom() int64 {
+// ForwardedFromID returns the sender ID of the original message, or 0.
+func (m *MCUBMessage) ForwardedFromID() int64 {
 	if m.Raw == nil {
 		return 0
 	}
@@ -406,6 +409,507 @@ func (m *MCUBMessage) GetButton(row, col int) *MessageButton {
 		return nil
 	}
 	return r[col]
+}
+
+// ---------------------------------------------------------------------------
+// Additional accessors mirroring Telethon's custom Message class
+// ---------------------------------------------------------------------------
+
+// RawText returns the plain message text without any markdown formatting.
+// Equivalent to Telethon's raw_text property.
+func (m *MCUBMessage) RawText() string {
+	if m.Raw == nil {
+		return ""
+	}
+	return m.Raw.Message
+}
+
+// IsEdited reports whether the message has been edited.
+func (m *MCUBMessage) IsEdited() bool {
+	if m.Raw == nil {
+		return false
+	}
+	return m.Raw.EditDate != 0
+}
+
+// IsPinned reports whether the message is currently pinned.
+func (m *MCUBMessage) IsPinned() bool {
+	if m.Raw == nil {
+		return false
+	}
+	return m.Raw.Pinned
+}
+
+// IsSilent reports whether the message was sent silently.
+func (m *MCUBMessage) IsSilent() bool {
+	if m.Raw == nil {
+		return false
+	}
+	return m.Raw.Silent
+}
+
+// IsScheduled reports whether the message originated from a scheduled message.
+func (m *MCUBMessage) IsScheduled() bool {
+	if m.Raw == nil {
+		return false
+	}
+	return m.Raw.FromScheduled
+}
+
+// IsService reports whether this is a service message (always false for tg.Message).
+// Service messages use tg.MessageService; this wrapper only wraps tg.Message.
+func (m *MCUBMessage) IsService() bool {
+	return false
+}
+
+// ReplyToMsgID returns the ID of the message being replied to (0 if not a reply).
+// Alias for ReplyToID() for Telethon naming compatibility.
+func (m *MCUBMessage) ReplyToMsgID() int {
+	return m.ReplyToID()
+}
+
+// ReplyToTopID returns the thread/topic ID for forum topics, or 0.
+func (m *MCUBMessage) ReplyToTopID() int {
+	if m.Raw == nil || m.Raw.ReplyTo == nil {
+		return 0
+	}
+	if rt, ok := m.Raw.ReplyTo.(*tg.MessageReplyHeader); ok {
+		id, _ := rt.GetReplyToTopID()
+		return id
+	}
+	return 0
+}
+
+// ForwardedFrom returns an MCUBForward wrapping the forward header, or nil.
+func (m *MCUBMessage) ForwardedFrom() *MCUBForward {
+	if m.Raw == nil {
+		return nil
+	}
+	fwd, ok := m.Raw.GetFwdFrom()
+	if !ok {
+		return nil
+	}
+	return NewForward(&fwd)
+}
+
+// Entities returns the message formatting entities.
+func (m *MCUBMessage) Entities() []tg.MessageEntityClass {
+	if m.Raw == nil {
+		return nil
+	}
+	return m.Raw.Entities
+}
+
+// File returns an MCUBFile wrapping the photo or document in this message.
+// Returns nil when the media type is not a file (polls, dice, etc.).
+func (m *MCUBMessage) File() *MCUBFile {
+	if m.Raw == nil {
+		return nil
+	}
+	return NewFile(m.Raw)
+}
+
+// Photo returns the *tg.Photo from the message media, or nil.
+func (m *MCUBMessage) Photo() *tg.Photo {
+	if !m.HasMedia() {
+		return nil
+	}
+	mmp, ok := m.Raw.Media.(*tg.MessageMediaPhoto)
+	if !ok {
+		return nil
+	}
+	photo, ok := mmp.Photo.(*tg.Photo)
+	if !ok {
+		return nil
+	}
+	return photo
+}
+
+// Document returns the *tg.Document from the message media, or nil.
+func (m *MCUBMessage) Document() *tg.Document {
+	return m.document()
+}
+
+// Audio returns the document if it's an audio track (not a voice note), else nil.
+func (m *MCUBMessage) Audio() *tg.Document {
+	return m.documentByAttr(func(a tg.DocumentAttributeClass) bool {
+		if aa, ok := a.(*tg.DocumentAttributeAudio); ok {
+			return !aa.Voice
+		}
+		return false
+	})
+}
+
+// Voice returns the document if it's a voice note, else nil.
+func (m *MCUBMessage) Voice() *tg.Document {
+	return m.documentByAttr(func(a tg.DocumentAttributeClass) bool {
+		if aa, ok := a.(*tg.DocumentAttributeAudio); ok {
+			return aa.Voice
+		}
+		return false
+	})
+}
+
+// Video returns the document if it's a video (not a video note), else nil.
+func (m *MCUBMessage) Video() *tg.Document {
+	return m.documentByAttr(func(a tg.DocumentAttributeClass) bool {
+		if va, ok := a.(*tg.DocumentAttributeVideo); ok {
+			return !va.RoundMessage
+		}
+		return false
+	})
+}
+
+// VideoNote returns the document if it's a video note (round message), else nil.
+func (m *MCUBMessage) VideoNote() *tg.Document {
+	return m.documentByAttr(func(a tg.DocumentAttributeClass) bool {
+		if va, ok := a.(*tg.DocumentAttributeVideo); ok {
+			return va.RoundMessage
+		}
+		return false
+	})
+}
+
+// Sticker returns the document if it's a sticker, else nil.
+func (m *MCUBMessage) Sticker() *tg.Document {
+	return m.documentByAttr(func(a tg.DocumentAttributeClass) bool {
+		_, ok := a.(*tg.DocumentAttributeSticker)
+		return ok
+	})
+}
+
+// GIF returns the document if it's an animated GIF/mp4, else nil.
+func (m *MCUBMessage) GIF() *tg.Document {
+	return m.documentByAttr(func(a tg.DocumentAttributeClass) bool {
+		_, ok := a.(*tg.DocumentAttributeAnimated)
+		return ok
+	})
+}
+
+// documentByAttr returns the document if it has an attribute matching the predicate.
+func (m *MCUBMessage) documentByAttr(pred func(tg.DocumentAttributeClass) bool) *tg.Document {
+	doc := m.document()
+	if doc == nil {
+		return nil
+	}
+	for _, attr := range doc.Attributes {
+		if pred(attr) {
+			return doc
+		}
+	}
+	return nil
+}
+
+// Contact returns the contact media, or nil.
+func (m *MCUBMessage) Contact() *tg.MessageMediaContact {
+	if !m.HasMedia() {
+		return nil
+	}
+	c, _ := m.Raw.Media.(*tg.MessageMediaContact)
+	return c
+}
+
+// Location returns the geo media, or nil.
+func (m *MCUBMessage) Location() *tg.MessageMediaGeo {
+	if !m.HasMedia() {
+		return nil
+	}
+	g, _ := m.Raw.Media.(*tg.MessageMediaGeo)
+	return g
+}
+
+// Venue returns the venue media, or nil.
+func (m *MCUBMessage) Venue() *tg.MessageMediaVenue {
+	if !m.HasMedia() {
+		return nil
+	}
+	v, _ := m.Raw.Media.(*tg.MessageMediaVenue)
+	return v
+}
+
+// Poll returns the poll media, or nil.
+func (m *MCUBMessage) Poll() *tg.MessageMediaPoll {
+	if !m.HasMedia() {
+		return nil
+	}
+	p, _ := m.Raw.Media.(*tg.MessageMediaPoll)
+	return p
+}
+
+// Dice returns the dice media, or nil.
+func (m *MCUBMessage) Dice() *tg.MessageMediaDice {
+	if !m.HasMedia() {
+		return nil
+	}
+	d, _ := m.Raw.Media.(*tg.MessageMediaDice)
+	return d
+}
+
+// Game returns the game media, or nil.
+func (m *MCUBMessage) Game() *tg.MessageMediaGame {
+	if !m.HasMedia() {
+		return nil
+	}
+	g, _ := m.Raw.Media.(*tg.MessageMediaGame)
+	return g
+}
+
+// WebPreview returns the web page media, or nil.
+func (m *MCUBMessage) WebPreview() *tg.MessageMediaWebPage {
+	if !m.HasMedia() {
+		return nil
+	}
+	w, _ := m.Raw.Media.(*tg.MessageMediaWebPage)
+	return w
+}
+
+// GetButtonByText returns the first button whose text matches, or nil.
+func (m *MCUBMessage) GetButtonByText(text string) *MessageButton {
+	for _, row := range m.Buttons() {
+		for _, btn := range row {
+			if btn.Text == text {
+				return btn
+			}
+		}
+	}
+	return nil
+}
+
+// GetButtonByData returns the first button whose data equals data, or nil.
+func (m *MCUBMessage) GetButtonByData(data []byte) *MessageButton {
+	for _, row := range m.Buttons() {
+		for _, btn := range row {
+			if bytes.Equal(btn.Data, data) {
+				return btn
+			}
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Action methods (require a client that implements the relevant interface)
+// ---------------------------------------------------------------------------
+
+// Reply sends a message as a reply to this message and returns the sent message.
+func (m *MCUBMessage) Reply(ctx context.Context, text string) (*MCUBMessage, error) {
+	if m.Raw == nil {
+		return nil, fmt.Errorf("nil message")
+	}
+	type replyClient interface {
+		SendReply(ctx context.Context, chatID int64, text string, replyToMsgID int) (*tg.Message, error)
+	}
+	c, ok := m.Client.(replyClient)
+	if !ok {
+		return nil, fmt.Errorf("client does not implement SendReply")
+	}
+	sent, err := c.SendReply(ctx, m.ChatID, text, m.Raw.ID)
+	if err != nil {
+		return nil, err
+	}
+	return NewMCUBMessage(sent, m.Client), nil
+}
+
+// Respond sends a message to the same chat without replying to a specific message.
+func (m *MCUBMessage) Respond(ctx context.Context, text string) (*MCUBMessage, error) {
+	if m.Raw == nil {
+		return nil, fmt.Errorf("nil message")
+	}
+	type respondClient interface {
+		SendText(ctx context.Context, chatID int64, text string) (*tg.Message, error)
+	}
+	c, ok := m.Client.(respondClient)
+	if !ok {
+		return nil, fmt.Errorf("client does not implement SendText")
+	}
+	sent, err := c.SendText(ctx, m.ChatID, text)
+	if err != nil {
+		return nil, err
+	}
+	return NewMCUBMessage(sent, m.Client), nil
+}
+
+// Edit edits the message text.
+func (m *MCUBMessage) Edit(ctx context.Context, text string) (*MCUBMessage, error) {
+	if m.Raw == nil {
+		return nil, fmt.Errorf("nil message")
+	}
+	type editClient interface {
+		EditMessage(ctx context.Context, chatID int64, msgID int, text string) (*tg.Message, error)
+	}
+	c, ok := m.Client.(editClient)
+	if !ok {
+		return nil, fmt.Errorf("client does not implement EditMessage")
+	}
+	edited, err := c.EditMessage(ctx, m.ChatID, m.Raw.ID, text)
+	if err != nil {
+		return nil, err
+	}
+	return NewMCUBMessage(edited, m.Client), nil
+}
+
+// Delete deletes the message.  If revoke is true, it is also deleted for the other party.
+func (m *MCUBMessage) Delete(ctx context.Context, revoke bool) error {
+	if m.Raw == nil {
+		return fmt.Errorf("nil message")
+	}
+	type deleteClient interface {
+		DeleteMessages(ctx context.Context, chatID int64, msgIDs []int, revoke bool) error
+	}
+	c, ok := m.Client.(deleteClient)
+	if !ok {
+		return fmt.Errorf("client does not implement DeleteMessages")
+	}
+	return c.DeleteMessages(ctx, m.ChatID, []int{m.Raw.ID}, revoke)
+}
+
+// Pin pins the message.  If notify is true, members receive a notification.
+func (m *MCUBMessage) Pin(ctx context.Context, notify bool) error {
+	if m.Raw == nil {
+		return fmt.Errorf("nil message")
+	}
+	type pinClient interface {
+		PinMessage(ctx context.Context, chatID int64, msgID int, notify bool) error
+	}
+	c, ok := m.Client.(pinClient)
+	if !ok {
+		return fmt.Errorf("client does not implement PinMessage")
+	}
+	return c.PinMessage(ctx, m.ChatID, m.Raw.ID, notify)
+}
+
+// Unpin unpins the message.
+func (m *MCUBMessage) Unpin(ctx context.Context) error {
+	if m.Raw == nil {
+		return fmt.Errorf("nil message")
+	}
+	type unpinClient interface {
+		UnpinMessage(ctx context.Context, chatID int64, msgID int) error
+	}
+	c, ok := m.Client.(unpinClient)
+	if !ok {
+		return fmt.Errorf("client does not implement UnpinMessage")
+	}
+	return c.UnpinMessage(ctx, m.ChatID, m.Raw.ID)
+}
+
+// Forward forwards this message to another chat and returns the forwarded copy.
+func (m *MCUBMessage) Forward(ctx context.Context, toChatID int64) (*MCUBMessage, error) {
+	if m.Raw == nil {
+		return nil, fmt.Errorf("nil message")
+	}
+	type forwardClient interface {
+		ForwardMessages(ctx context.Context, fromChatID int64, msgIDs []int, toChatID int64) ([]*tg.Message, error)
+	}
+	c, ok := m.Client.(forwardClient)
+	if !ok {
+		return nil, fmt.Errorf("client does not implement ForwardMessages")
+	}
+	msgs, err := c.ForwardMessages(ctx, m.ChatID, []int{m.Raw.ID}, toChatID)
+	if err != nil || len(msgs) == 0 {
+		return nil, err
+	}
+	return NewMCUBMessage(msgs[0], m.Client), nil
+}
+
+// Download downloads the message media to filePath.
+func (m *MCUBMessage) Download(ctx context.Context, filePath string) error {
+	if m.Raw == nil {
+		return fmt.Errorf("nil message")
+	}
+	type downloadClient interface {
+		DownloadMedia(ctx context.Context, msg *tg.Message, filePath string) error
+	}
+	c, ok := m.Client.(downloadClient)
+	if !ok {
+		return fmt.Errorf("client does not implement DownloadMedia")
+	}
+	return c.DownloadMedia(ctx, m.Raw, filePath)
+}
+
+// GetReplyMessage fetches the message this one is replying to, or nil.
+func (m *MCUBMessage) GetReplyMessage(ctx context.Context) (*MCUBMessage, error) {
+	if m.Raw == nil || m.Raw.ReplyTo == nil {
+		return nil, nil
+	}
+	rt, ok := m.Raw.ReplyTo.(*tg.MessageReplyHeader)
+	if !ok {
+		return nil, nil
+	}
+	type getMsgClient interface {
+		GetMessage(ctx context.Context, chatID int64, msgID int) (*tg.Message, error)
+	}
+	c, ok2 := m.Client.(getMsgClient)
+	if !ok2 {
+		return nil, fmt.Errorf("client does not implement GetMessage")
+	}
+	raw, err := c.GetMessage(ctx, m.ChatID, rt.ReplyToMsgID)
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil {
+		return nil, nil
+	}
+	return NewMCUBMessage(raw, m.Client), nil
+}
+
+// ClickButton clicks the button at position (row, col) in the inline keyboard.
+func (m *MCUBMessage) ClickButton(ctx context.Context, row, col int) error {
+	if m.Raw == nil {
+		return fmt.Errorf("nil message")
+	}
+	btn := m.GetButton(row, col)
+	if btn == nil {
+		return fmt.Errorf("button not found at (%d, %d)", row, col)
+	}
+	type clickClient interface {
+		ClickButton(ctx context.Context, chatID int64, msgID int, data []byte) error
+	}
+	c, ok := m.Client.(clickClient)
+	if !ok {
+		return fmt.Errorf("client does not implement ClickButton")
+	}
+	return c.ClickButton(ctx, m.ChatID, m.Raw.ID, btn.Data)
+}
+
+// React sends an emoji reaction to this message.
+func (m *MCUBMessage) React(ctx context.Context, emoji string) error {
+	if m.Raw == nil {
+		return fmt.Errorf("nil message")
+	}
+	type reactClient interface {
+		SendReaction(ctx context.Context, chatID int64, msgID int, emoji string) error
+	}
+	c, ok := m.Client.(reactClient)
+	if !ok {
+		return fmt.Errorf("client does not implement SendReaction")
+	}
+	return c.SendReaction(ctx, m.ChatID, m.Raw.ID, emoji)
+}
+
+// MarkRead marks this message and all previous ones in the chat as read.
+func (m *MCUBMessage) MarkRead(ctx context.Context) error {
+	if m.Raw == nil {
+		return fmt.Errorf("nil message")
+	}
+	type markReadClient interface {
+		MarkRead(ctx context.Context, chatID int64) error
+	}
+	c, ok := m.Client.(markReadClient)
+	if !ok {
+		return fmt.Errorf("client does not implement MarkRead")
+	}
+	return c.MarkRead(ctx, m.ChatID)
+}
+
+// NewMessage constructs an MCUBMessage with an explicit chatID override.
+// Use this when you already know the chat ID (e.g. from an update container).
+func NewMessage(raw *tg.Message, client interface{}, chatID int64) *MCUBMessage {
+	m := NewMCUBMessage(raw, client)
+	if chatID != 0 {
+		m.ChatID = chatID
+	}
+	return m
 }
 
 // NewMCUBMessage wraps a raw tg.Message into a MCUBMessage, resolving peer IDs.

@@ -3,11 +3,16 @@ package session
 
 import (
 	"context"
+	"crypto/sha1" // #nosec
 	"database/sql"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/gotd/td/session"
@@ -251,4 +256,180 @@ func (s *SQLiteSessionStorage) StoreSession(ctx context.Context, data []byte) er
 		return fmt.Errorf("store session: %w", err)
 	}
 	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// StringSession — Telethon-compatible string session codec.
+//
+// Binary layout (big-endian, no version byte in binary payload):
+//
+//	┌────────┬──────────────┬──────────┬─────────────────┐
+//	│ DC ID  │ IP address   │ Port     │ Auth key         │
+//	│ 1 byte │ 4 or 16 bytes│ 2 bytes  │ 256 bytes        │
+//	└────────┴──────────────┴──────────┴─────────────────┘
+//	= 263 bytes (IPv4) or 275 bytes (IPv6)
+//
+// The binary is base64url-encoded (with standard '=' padding, matching Python's
+// base64.urlsafe_b64encode), then prefixed with the ASCII character "1".
+//
+// Reference: Telethon sessions/string.py
+// ─────────────────────────────────────────────────────────────────────────────
+
+const stringSessionVersion = '1'
+
+// StringSession encodes/decodes Telethon-compatible session strings.
+type StringSession struct {
+	DCID       int
+	ServerAddr string // plain IPv4 or IPv6, e.g. "149.154.167.51"
+	Port       int
+	AuthKey    []byte // exactly 256 bytes when set
+}
+
+// NewStringSession creates an empty StringSession.
+func NewStringSession() *StringSession {
+	return &StringSession{}
+}
+
+// ParseString parses a Telethon string session.
+// The string must start with "1" (the current Telethon session version).
+// An empty string returns an empty session without error.
+func ParseString(s string) (*StringSession, error) {
+	if s == "" {
+		return NewStringSession(), nil
+	}
+	if s[0] != stringSessionVersion {
+		return nil, fmt.Errorf("unsupported string session version %q (expected '1')", s[0])
+	}
+
+	// Try standard base64url (with '=' padding) first, then raw (without padding).
+	raw, err := base64.URLEncoding.DecodeString(s[1:])
+	if err != nil {
+		raw, err = base64.RawURLEncoding.DecodeString(s[1:])
+		if err != nil {
+			return nil, fmt.Errorf("decode string session: %w", err)
+		}
+	}
+
+	var ipLen int
+	switch len(raw) {
+	case 263:
+		ipLen = 4
+	case 275:
+		ipLen = 16
+	default:
+		return nil, fmt.Errorf("invalid string session payload length: %d (want 263 or 275)", len(raw))
+	}
+
+	dcID := int(raw[0])
+	ip := net.IP(raw[1 : 1+ipLen])
+	port := int(binary.BigEndian.Uint16(raw[1+ipLen : 3+ipLen]))
+	authKey := make([]byte, 256)
+	copy(authKey, raw[3+ipLen:])
+
+	return &StringSession{
+		DCID:       dcID,
+		ServerAddr: ip.String(),
+		Port:       port,
+		AuthKey:    authKey,
+	}, nil
+}
+
+// Encode encodes the session to a Telethon-compatible string.
+// Returns "" if AuthKey is not set.
+func (s *StringSession) Encode() string {
+	if len(s.AuthKey) == 0 {
+		return ""
+	}
+
+	ip := net.ParseIP(s.ServerAddr)
+	if ip == nil {
+		return ""
+	}
+
+	var ipBytes []byte
+	if ip4 := ip.To4(); ip4 != nil {
+		ipBytes = []byte(ip4)
+	} else if ip6 := ip.To16(); ip6 != nil {
+		ipBytes = []byte(ip6)
+	} else {
+		return ""
+	}
+
+	// Pack: dc_id(1) + ip(4|16) + port(2) + auth_key(256)
+	buf := make([]byte, 1+len(ipBytes)+2+256)
+	buf[0] = byte(s.DCID)
+	copy(buf[1:], ipBytes)
+	binary.BigEndian.PutUint16(buf[1+len(ipBytes):], uint16(s.Port))
+	key := make([]byte, 256)
+	copy(key, s.AuthKey)
+	copy(buf[3+len(ipBytes):], key)
+
+	return string([]byte{stringSessionVersion}) + base64.URLEncoding.EncodeToString(buf)
+}
+
+// ToStorage converts the StringSession into a gotd-compatible session.Storage.
+// The returned storage is backed by memory and can be passed directly to
+// telegram.Options.SessionStorage. Changes written back via StoreSession will
+// update the in-memory blob (but not this StringSession struct).
+func (s *StringSession) ToStorage() session.Storage {
+	mem := NewMemorySessionStorage()
+
+	if len(s.AuthKey) == 0 {
+		return mem
+	}
+
+	// Compute auth_key_id: last 8 bytes of SHA1(auth_key).
+	h := sha1.Sum(s.AuthKey) // #nosec
+	authKeyID := h[12:]      // bytes 12..19
+
+	// Build gotd session JSON: {"Version":1,"Data":{...}}
+	data := gotdSessionData{
+		Version: 1,
+		Data: gotdDataInner{
+			DC:        s.DCID,
+			Addr:      net.JoinHostPort(s.ServerAddr, strconv.Itoa(s.Port)),
+			AuthKey:   s.AuthKey,
+			AuthKeyID: authKeyID,
+			Salt:      0,
+		},
+	}
+
+	blob, err := json.Marshal(data)
+	if err != nil {
+		return mem
+	}
+
+	_ = mem.StoreSession(context.Background(), blob)
+	return mem
+}
+
+// gotdSessionData mirrors the private jsonData layout used by gotd's session.Loader.
+type gotdSessionData struct {
+	Version int           `json:"Version"`
+	Data    gotdDataInner `json:"Data"`
+}
+
+// gotdDataInner mirrors session.Data in gotd (public field names, standard JSON tags).
+type gotdDataInner struct {
+	Config    gotdConfig `json:"Config"`
+	DC        int        `json:"DC"`
+	Addr      string     `json:"Addr"`
+	AuthKey   []byte     `json:"AuthKey"`
+	AuthKeyID []byte     `json:"AuthKeyID"`
+	Salt      int64      `json:"Salt"`
+}
+
+// gotdConfig mirrors the subset of tg.Config stored in gotd sessions.
+// We only need to supply enough fields for the JSON schema to unmarshal cleanly.
+type gotdConfig struct {
+	BlockedMode     bool        `json:"BlockedMode"`
+	ForceTryIpv6    bool        `json:"ForceTryIpv6"`
+	Date            int         `json:"Date"`
+	Expires         int         `json:"Expires"`
+	TestMode        bool        `json:"TestMode"`
+	ThisDC          int         `json:"ThisDC"`
+	DCOptions       interface{} `json:"DCOptions"`
+	DCTxtDomainName string      `json:"DCTxtDomainName"`
+	TmpSessions     int         `json:"TmpSessions"`
+	WebfileDCID     int         `json:"WebfileDCID"`
 }

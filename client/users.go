@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/gotd/td/tg"
+
+	"github.com/nulls-brawl-site/telegram-mcub-go/types"
 )
 
 // ContactInfo holds a single contact entry for bulk import.
@@ -340,4 +342,197 @@ func (c *MCUBClient) GetFullUser(ctx context.Context, userID int64) (*tg.UsersUs
 		return nil, fmt.Errorf("get full user %d: %w", userID, err)
 	}
 	return result, nil
+}
+
+// --- Entity resolution ---
+
+// GetInputEntity resolves a variety of entity representations to an InputPeer.
+// The entity argument may be:
+//   - int64: interpreted as a peer ID (positive = user, negative = chat/channel)
+//   - string: interpreted as a @username (leading @ is stripped)
+//   - tg.InputPeerClass: returned as-is
+//   - tg.UserClass, tg.ChatClass: converted to the corresponding InputPeer
+func (c *MCUBClient) GetInputEntity(ctx context.Context, entity interface{}) (tg.InputPeerClass, error) {
+	switch v := entity.(type) {
+	case tg.InputPeerClass:
+		return v, nil
+	case *tg.InputPeerUser:
+		return v, nil
+	case *tg.InputPeerChat:
+		return v, nil
+	case *tg.InputPeerChannel:
+		return v, nil
+	case *tg.User:
+		return &tg.InputPeerUser{UserID: v.ID, AccessHash: v.AccessHash}, nil
+	case *tg.Channel:
+		return &tg.InputPeerChannel{ChannelID: v.ID, AccessHash: v.AccessHash}, nil
+	case *tg.Chat:
+		return &tg.InputPeerChat{ChatID: v.ID}, nil
+	case int64:
+		peer, err := c.resolvePeer(ctx, v)
+		if err != nil {
+			return nil, fmt.Errorf("get input entity %d: %w", v, err)
+		}
+		return peer, nil
+	case string:
+		username := v
+		if len(username) > 0 && username[0] == '@' {
+			username = username[1:]
+		}
+		result, err := c.api.ContactsResolveUsername(ctx, username)
+		if err != nil {
+			return nil, fmt.Errorf("resolve username %q: %w", v, err)
+		}
+		switch p := result.Peer.(type) {
+		case *tg.PeerUser:
+			return &tg.InputPeerUser{UserID: p.UserID}, nil
+		case *tg.PeerChat:
+			return &tg.InputPeerChat{ChatID: p.ChatID}, nil
+		case *tg.PeerChannel:
+			return &tg.InputPeerChannel{ChannelID: p.ChannelID}, nil
+		}
+		return nil, fmt.Errorf("entity %q not found", v)
+	default:
+		return nil, fmt.Errorf("unsupported entity type %T", entity)
+	}
+}
+
+// GetInputPeer resolves a numeric peer ID to an InputPeer.
+// This is an alias for GetInputEntity with an int64 argument.
+func (c *MCUBClient) GetInputPeer(ctx context.Context, peerID int64) (tg.InputPeerClass, error) {
+	return c.GetInputEntity(ctx, peerID)
+}
+
+// --- Participant permissions ---
+
+// GetPermissions returns a ParticipantPermissions for userID inside chatID.
+// chatID must be a supergroup/channel (peer ID < -999999999).
+func (c *MCUBClient) GetPermissions(ctx context.Context, chatID, userID int64) (*types.ParticipantPermissions, error) {
+	participant, err := c.getChannelParticipant(ctx, chatID, userID)
+	if err != nil {
+		return nil, err
+	}
+	return types.NewParticipantPermissions(participant, false), nil
+}
+
+// GetParticipantFull returns the raw ChannelParticipantClass for a user in a channel.
+func (c *MCUBClient) GetParticipantFull(ctx context.Context, chatID, userID int64) (interface{}, error) {
+	return c.getChannelParticipant(ctx, chatID, userID)
+}
+
+// getChannelParticipant fetches the raw participant record from a channel/supergroup.
+func (c *MCUBClient) getChannelParticipant(ctx context.Context, chatID, userID int64) (tg.ChannelParticipantClass, error) {
+	channel, err := c.resolveInputChannel(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.api.ChannelsGetParticipant(ctx, &tg.ChannelsGetParticipantRequest{
+		Channel:     channel,
+		Participant: &tg.InputPeerUser{UserID: userID},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get participant %d in %d: %w", userID, chatID, err)
+	}
+	return result.Participant, nil
+}
+
+// GetAdminRights returns the ChatAdminRights for a user if they are an admin,
+// or nil if they are not. Returns an error if the participant cannot be fetched.
+func (c *MCUBClient) GetAdminRights(ctx context.Context, chatID, userID int64) (interface{}, error) {
+	participant, err := c.getChannelParticipant(ctx, chatID, userID)
+	if err != nil {
+		return nil, err
+	}
+	switch v := participant.(type) {
+	case *tg.ChannelParticipantAdmin:
+		return &v.AdminRights, nil
+	case *tg.ChannelParticipantCreator:
+		return &v.AdminRights, nil
+	}
+	return nil, nil
+}
+
+// --- EditAdmin ---
+
+// EditAdminParams holds the parameters for promoting or demoting an admin.
+type EditAdminParams struct {
+	// ChatID is the channel or supergroup peer ID.
+	ChatID int64
+	// UserID is the target user.
+	UserID int64
+
+	// Admin rights flags.
+	ChangeInfo     bool
+	PostMessages   bool
+	EditMessages   bool
+	DeleteMessages bool
+	BanUsers       bool
+	InviteUsers    bool
+	PinMessages    bool
+	AddAdmins      bool
+	Anonymous      bool
+	ManageCall     bool
+
+	// Rank is the custom admin title (empty = no title).
+	Rank string
+
+	// Demote removes all admin rights when true (all rights flags are ignored).
+	Demote bool
+}
+
+// EditAdmin promotes or demotes a user in a channel or supergroup.
+// Set Demote = true to remove all admin privileges.
+func (c *MCUBClient) EditAdmin(ctx context.Context, params EditAdminParams) error {
+	channel, err := c.resolveInputChannel(ctx, params.ChatID)
+	if err != nil {
+		return err
+	}
+
+	var rights tg.ChatAdminRights
+	if !params.Demote {
+		rights = tg.ChatAdminRights{
+			ChangeInfo:     params.ChangeInfo,
+			PostMessages:   params.PostMessages,
+			EditMessages:   params.EditMessages,
+			DeleteMessages: params.DeleteMessages,
+			BanUsers:       params.BanUsers,
+			InviteUsers:    params.InviteUsers,
+			PinMessages:    params.PinMessages,
+			AddAdmins:      params.AddAdmins,
+			Anonymous:      params.Anonymous,
+			ManageCall:     params.ManageCall,
+		}
+	}
+
+	_, err = c.api.ChannelsEditAdmin(ctx, &tg.ChannelsEditAdminRequest{
+		Channel:     channel,
+		UserID:      &tg.InputUser{UserID: params.UserID},
+		AdminRights: rights,
+		Rank:        params.Rank,
+	})
+	if err != nil {
+		return fmt.Errorf("edit admin %d in %d: %w", params.UserID, params.ChatID, err)
+	}
+	return nil
+}
+
+// --- IsBot / IsMutualContact ---
+
+// IsBot returns true if the user identified by userID is a bot account.
+func (c *MCUBClient) IsBot(ctx context.Context, userID int64) (bool, error) {
+	user, err := c.GetUser(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	return user.Bot, nil
+}
+
+// IsMutualContact returns true if the given user has the current account in
+// their own contact list (i.e. the contact relationship is mutual).
+func (c *MCUBClient) IsMutualContact(ctx context.Context, userID int64) (bool, error) {
+	user, err := c.GetUser(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	return user.MutualContact, nil
 }

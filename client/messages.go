@@ -392,14 +392,30 @@ func (c *MCUBClient) ReadHistory(ctx context.Context, peerID int64, maxID int) e
 // resolvePeer converts a numeric peer ID to a tg.InputPeerClass.
 func (c *MCUBClient) resolvePeer(ctx context.Context, peerID int64) (tg.InputPeerClass, error) {
 	_ = ctx
-	if peerID > 0 {
-		return &tg.InputPeerUser{UserID: peerID}, nil
+	if peerID == 0 {
+		return &tg.InputPeerSelf{}, nil
 	}
+	// Positive → user
+	if peerID > 0 {
+		return &tg.InputPeerUser{UserID: peerID, AccessHash: 0}, nil
+	}
+	// Packed channel/supergroup peer ID: -(channel_id + 1_000_000_000_000)
 	if peerID < -999999999 {
 		chanID := channelIDFromPeerID(peerID)
-		return &tg.InputPeerChannel{ChannelID: chanID}, nil
+		return &tg.InputPeerChannel{ChannelID: chanID, AccessHash: 0}, nil
 	}
+	// Basic group
 	return &tg.InputPeerChat{ChatID: -peerID}, nil
+}
+
+// resolveInputUser converts a user ID to tg.InputUserClass.
+// Pass 0 to get InputUserSelf.
+func (c *MCUBClient) resolveInputUser(ctx context.Context, userID int64) (tg.InputUserClass, error) {
+	_ = ctx
+	if userID == 0 {
+		return &tg.InputUserSelf{}, nil
+	}
+	return &tg.InputUser{UserID: userID, AccessHash: 0}, nil
 }
 
 // channelIDFromPeerID extracts the raw channel ID from a packed peer ID.
@@ -849,4 +865,355 @@ func (c *MCUBClient) GetMessageLink(ctx context.Context, peerID int64, msgID int
 		return "", fmt.Errorf("get message link: %w", err)
 	}
 	return result.Link, nil
+}
+
+// --- Additional methods (ported from Telethon-MCUB) ---
+
+// GetPinnedMessages returns all pinned messages in a chat/channel.
+// It uses the InputMessagesFilterPinned filter to retrieve only pinned messages.
+func (c *MCUBClient) GetPinnedMessages(ctx context.Context, peerID int64) ([]*tg.Message, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	result, err := c.api.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+		Peer:   peer,
+		Filter: &tg.InputMessagesFilterPinned{},
+		Limit:  100,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get pinned messages: %w", err)
+	}
+	return extractMessages(result), nil
+}
+
+// ClearPinnedMessages unpins all pinned messages in a chat.
+// For channels it uses channels.updatePinnedMessage; for regular chats it
+// iterates the pinned list and unpins each message.
+func (c *MCUBClient) ClearPinnedMessages(ctx context.Context, peerID int64) error {
+	msgs, err := c.GetPinnedMessages(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("clear pinned: fetch: %w", err)
+	}
+
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("clear pinned: resolve peer: %w", err)
+	}
+	for _, msg := range msgs {
+		_, unpinErr := c.api.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+			Peer:  peer,
+			ID:    msg.ID,
+			Unpin: true,
+		})
+		if unpinErr != nil {
+			return fmt.Errorf("unpin message %d: %w", msg.ID, unpinErr)
+		}
+	}
+	return nil
+}
+
+// SearchGlobal performs a global search across all chats and returns up to limit messages.
+func (c *MCUBClient) SearchGlobal(ctx context.Context, query string, limit int) ([]*tg.Message, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	result, err := c.api.MessagesSearchGlobal(ctx, &tg.MessagesSearchGlobalRequest{
+		Q:          query,
+		Filter:     &tg.InputMessagesFilterEmpty{},
+		OffsetPeer: &tg.InputPeerEmpty{},
+		Limit:      limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search global %q: %w", query, err)
+	}
+	return extractMessages(result), nil
+}
+
+// SendPoll sends a poll to peerID.
+// If quiz is true the poll is a quiz poll (single correct answer).
+// Returns the sent message.
+func (c *MCUBClient) SendPoll(ctx context.Context, peerID int64, question string, answers []string, quiz bool) (*tg.Message, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	pollAnswers := make([]tg.PollAnswer, len(answers))
+	for i, a := range answers {
+		pollAnswers[i] = tg.PollAnswer{
+			Text:   a,
+			Option: []byte{byte(i)},
+		}
+	}
+
+	media := &tg.InputMediaPoll{
+		Poll: tg.Poll{
+			Question: question,
+			Answers:  pollAnswers,
+			Quiz:     quiz,
+		},
+	}
+
+	result, err := c.api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+		Peer:     peer,
+		Media:    media,
+		RandomID: rand.Int63(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("send poll: %w", err)
+	}
+	return extractMessageFromUpdates(result), nil
+}
+
+// StopPoll closes (stops accepting votes for) a poll identified by msgID in peerID.
+// Returns the updated message.
+func (c *MCUBClient) StopPoll(ctx context.Context, peerID int64, msgID int) (*tg.Message, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	result, err := c.api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
+		Peer:  peer,
+		ID:    msgID,
+		Media: &tg.InputMediaPoll{Poll: tg.Poll{Closed: true}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("stop poll message %d: %w", msgID, err)
+	}
+	return extractMessageFromUpdates(result), nil
+}
+
+// GetVotes returns the vote information for a specific poll answer option.
+// option is the raw option bytes (as returned by PollAnswer.Option).
+// limit controls how many votes to return per call (0 = server default).
+func (c *MCUBClient) GetVotes(ctx context.Context, peerID int64, msgID int, option []byte, limit int) ([]tg.MessagePeerVoteClass, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	req := &tg.MessagesGetPollVotesRequest{
+		Peer:  peer,
+		ID:    msgID,
+		Limit: limit,
+	}
+	if len(option) > 0 {
+		req.SetOption(option)
+	}
+
+	result, err := c.api.MessagesGetPollVotes(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("get poll votes: %w", err)
+	}
+	return result.Votes, nil
+}
+
+// EditMessageCaption edits the caption of a media message (document, photo, etc.).
+func (c *MCUBClient) EditMessageCaption(ctx context.Context, peerID int64, msgID int, caption string) (*tg.Message, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	result, err := c.api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
+		Peer:    peer,
+		ID:      msgID,
+		Message: caption,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("edit caption message %d: %w", msgID, err)
+	}
+	return extractMessageFromUpdates(result), nil
+}
+
+// CopyMessage forwards a message to toPeerID without the "Forwarded from" header
+// by re-sending the message content rather than forwarding it.
+func (c *MCUBClient) CopyMessage(ctx context.Context, fromPeerID int64, msgID int, toPeerID int64) (*tg.Message, error) {
+	msgs, err := c.GetMessages(ctx, fromPeerID, []int{msgID})
+	if err != nil {
+		return nil, fmt.Errorf("copy message: fetch source: %w", err)
+	}
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("copy message: message %d not found in peer %d", msgID, fromPeerID)
+	}
+
+	src := msgs[0]
+	toPeer, err := c.resolvePeer(ctx, toPeerID)
+	if err != nil {
+		return nil, fmt.Errorf("copy message: resolve target peer: %w", err)
+	}
+
+	req := &tg.MessagesSendMessageRequest{
+		Peer:     toPeer,
+		Message:  src.Message,
+		RandomID: rand.Int63(),
+	}
+
+	// Carry the media if present.
+	if src.Media != nil {
+		mediaReq := &tg.MessagesSendMediaRequest{
+			Peer:     toPeer,
+			Message:  src.Message,
+			RandomID: rand.Int63(),
+		}
+		switch m := src.Media.(type) {
+		case *tg.MessageMediaPhoto:
+			if photo, ok := m.Photo.(*tg.Photo); ok {
+				mediaReq.Media = &tg.InputMediaPhoto{
+					ID: &tg.InputPhoto{
+						ID:            photo.ID,
+						AccessHash:    photo.AccessHash,
+						FileReference: photo.FileReference,
+					},
+				}
+				result, sendErr := c.api.MessagesSendMedia(ctx, mediaReq)
+				if sendErr != nil {
+					return nil, fmt.Errorf("copy message: send media: %w", sendErr)
+				}
+				return extractMessageFromUpdates(result), nil
+			}
+		case *tg.MessageMediaDocument:
+			if doc, ok := m.Document.(*tg.Document); ok {
+				mediaReq.Media = &tg.InputMediaDocument{
+					ID: &tg.InputDocument{
+						ID:            doc.ID,
+						AccessHash:    doc.AccessHash,
+						FileReference: doc.FileReference,
+					},
+				}
+				result, sendErr := c.api.MessagesSendMedia(ctx, mediaReq)
+				if sendErr != nil {
+					return nil, fmt.Errorf("copy message: send media: %w", sendErr)
+				}
+				return extractMessageFromUpdates(result), nil
+			}
+		}
+	}
+
+	// Text-only message.
+	result, err := c.api.MessagesSendMessage(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("copy message: send: %w", err)
+	}
+	return extractMessageFromUpdates(result), nil
+}
+
+// GetMessageByLink resolves a t.me/... link to a message.
+// Supports public channel links (t.me/username/123).
+// For private links (t.me/c/channel_id/msg_id) the channel ID must already be
+// accessible by the account.
+func (c *MCUBClient) GetMessageByLink(ctx context.Context, link string) (*tg.Message, error) {
+	// Strip common prefixes.
+	for _, pfx := range []string{"https://t.me/", "http://t.me/", "t.me/"} {
+		if len(link) > len(pfx) && link[:len(pfx)] == pfx {
+			link = link[len(pfx):]
+			break
+		}
+	}
+
+	// Private link format: c/<channel_id>/<msg_id>
+	if len(link) > 2 && link[:2] == "c/" {
+		var chanID, msgID int64
+		if _, err := fmt.Sscanf(link[2:], "%d/%d", &chanID, &msgID); err == nil {
+			// Reconstruct packed peer ID.
+			packedPeerID := -(chanID + 1000000000000)
+			msgs, err := c.GetMessages(ctx, packedPeerID, []int{int(msgID)})
+			if err != nil {
+				return nil, fmt.Errorf("get message by private link %q: %w", link, err)
+			}
+			if len(msgs) == 0 {
+				return nil, fmt.Errorf("get message by private link %q: not found", link)
+			}
+			return msgs[0], nil
+		}
+	}
+
+	// Public link format: <username>/<msg_id>
+	var username string
+	var msgID int
+	if _, err := fmt.Sscanf(link, "%s", &username); err != nil {
+		return nil, fmt.Errorf("get message by link %q: cannot parse", link)
+	}
+	// Split on /
+	for i, ch := range link {
+		if ch == '/' {
+			username = link[:i]
+			if _, err := fmt.Sscanf(link[i+1:], "%d", &msgID); err != nil {
+				return nil, fmt.Errorf("get message by link %q: cannot parse message ID", link)
+			}
+			break
+		}
+	}
+	if msgID == 0 {
+		return nil, fmt.Errorf("get message by link %q: no message ID found", link)
+	}
+
+	// Resolve the username to a peer.
+	resolved, err := c.api.ContactsResolveUsername(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("get message by link %q: resolve username: %w", link, err)
+	}
+
+	var peer tg.InputPeerClass
+	switch p := resolved.Peer.(type) {
+	case *tg.PeerChannel:
+		peer = &tg.InputPeerChannel{ChannelID: p.ChannelID}
+	case *tg.PeerUser:
+		peer = &tg.InputPeerUser{UserID: p.UserID}
+	case *tg.PeerChat:
+		peer = &tg.InputPeerChat{ChatID: p.ChatID}
+	default:
+		return nil, fmt.Errorf("get message by link %q: unknown peer type %T", link, resolved.Peer)
+	}
+
+	_ = peer
+	// Fetch the message by ID relative to the resolved peer.
+	// We pack a temporary peer ID for GetMessages.
+	var peerID int64
+	switch p := resolved.Peer.(type) {
+	case *tg.PeerChannel:
+		peerID = -(p.ChannelID + 1000000000000)
+	case *tg.PeerUser:
+		peerID = p.UserID
+	case *tg.PeerChat:
+		peerID = -p.ChatID
+	}
+
+	msgs, err := c.GetMessages(ctx, peerID, []int{msgID})
+	if err != nil {
+		return nil, fmt.Errorf("get message by link %q: %w", link, err)
+	}
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("get message by link %q: message not found", link)
+	}
+	return msgs[0], nil
+}
+
+// SendInlineResult sends an inline bot query result to a chat.
+// queryID is the query ID from a bot.getInlineQueryResults call.
+// resultID is the identifier of the chosen result.
+func (c *MCUBClient) SendInlineResult(ctx context.Context, chatID int64, queryID int64, resultID string) (*tg.Message, error) {
+	peer, err := c.resolvePeer(ctx, chatID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	result, err := c.api.MessagesSendInlineBotResult(ctx, &tg.MessagesSendInlineBotResultRequest{
+		Peer:     peer,
+		QueryID:  queryID,
+		ID:       resultID,
+		RandomID: rand.Int63(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("send inline result: %w", err)
+	}
+	return extractMessageFromUpdates(result), nil
 }

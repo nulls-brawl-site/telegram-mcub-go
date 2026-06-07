@@ -3,8 +3,11 @@ package events
 
 import (
 	"context"
+	"sync"
 
 	"github.com/gotd/td/tg"
+
+	"github.com/nulls-brawl-site/telegram-mcub-go/types"
 )
 
 // Handler is the function signature for event handlers.
@@ -103,25 +106,163 @@ func middlewareFuncPtr(_ MiddlewareFunc) uintptr {
 // UpdateClass is an alias to make imports more ergonomic.
 type UpdateClass = tg.UpdateClass
 
+// ConversationManager routes incoming messages and edits to active Conversations.
+// Register a Conversation before it starts waiting, and Unregister it when done.
+type ConversationManager struct {
+	mu    sync.RWMutex
+	convs map[int64][]*types.Conversation // chatID -> active conversations
+}
+
+// NewConversationManager creates a new ConversationManager.
+func NewConversationManager() *ConversationManager {
+	return &ConversationManager{
+		convs: make(map[int64][]*types.Conversation),
+	}
+}
+
+// Register adds a Conversation to the manager so it receives delivered messages.
+func (cm *ConversationManager) Register(conv *types.Conversation) {
+	chatID := conv.ChatID()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.convs[chatID] = append(cm.convs[chatID], conv)
+}
+
+// Unregister removes a Conversation from the manager.
+func (cm *ConversationManager) Unregister(conv *types.Conversation) {
+	chatID := conv.ChatID()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	list := cm.convs[chatID]
+	result := list[:0]
+	for _, c := range list {
+		if c != conv {
+			result = append(result, c)
+		}
+	}
+	if len(result) == 0 {
+		delete(cm.convs, chatID)
+	} else {
+		cm.convs[chatID] = result
+	}
+}
+
+// Deliver routes a new incoming message to all conversations registered for that chat.
+func (cm *ConversationManager) Deliver(chatID int64, msg *tg.Message) {
+	cm.mu.RLock()
+	list := cm.convs[chatID]
+	cm.mu.RUnlock()
+	for _, c := range list {
+		c.Deliver(msg)
+	}
+}
+
+// DeliverEdit routes an edited message to all conversations registered for that chat.
+func (cm *ConversationManager) DeliverEdit(chatID int64, msg *tg.Message) {
+	cm.mu.RLock()
+	list := cm.convs[chatID]
+	cm.mu.RUnlock()
+	for _, c := range list {
+		c.DeliverEdit(msg)
+	}
+}
+
+// DeliverRead routes a max-read-ID notification to all conversations registered for that chat.
+func (cm *ConversationManager) DeliverRead(chatID int64, maxID int) {
+	cm.mu.RLock()
+	list := cm.convs[chatID]
+	cm.mu.RUnlock()
+	for _, c := range list {
+		c.DeliverRead(maxID)
+	}
+}
+
+// HandleUpdatesClass handles top-level update containers (*tg.Updates,
+// *tg.UpdatesCombined, etc.) that implement tg.UpdatesClass but not tg.UpdateClass.
+// Each contained update is dispatched individually via HandleUpdate.
+func (d *Dispatcher) HandleUpdatesClass(ctx context.Context, u tg.UpdatesClass) error {
+	switch upd := u.(type) {
+	case *tg.Updates:
+		return d.handleUpdates(ctx, upd)
+	case *tg.UpdatesCombined:
+		return d.handleUpdatesCombined(ctx, upd)
+	default:
+		// UpdatesNotModified, UpdateShort*, etc. — nothing to dispatch.
+		return nil
+	}
+}
+
 // HandleUpdate converts a raw TG update into the most specific event type
 // available and dispatches it.  Unrecognised updates are wrapped in Raw and
 // dispatched so catch-all handlers still fire.
+//
+// Dispatch order mirrors Telethon:
+//  1. NewMessage / MessageEdited
+//  2. MessageDeleted
+//  3. MessageRead
+//  4. ChatAction
+//  5. UserUpdate (typing, status)
+//  6. CallbackQuery
+//  7. InlineQuery
+//  8. JoinRequest
+//  9. Raw (catch-all)
 func (d *Dispatcher) HandleUpdate(ctx context.Context, u tg.UpdateClass) error {
+	// 1. NewMessage
 	if ev, ok := NewMessageFromUpdate(ctx, u); ok {
 		return d.Dispatch(ctx, ev)
 	}
-	if ev, ok := ChatActionFromUpdate(ctx, u); ok {
+	// 1b. MessageEdited
+	if ev, ok := MessageEditedFromUpdate(ctx, u); ok {
 		return d.Dispatch(ctx, ev)
 	}
-	if ev, ok := UserUpdateFromUpdate(ctx, u); ok {
-		return d.Dispatch(ctx, ev)
-	}
+	// 2. MessageDeleted
 	if ev, ok := MessageDeletedFromUpdate(ctx, u); ok {
 		return d.Dispatch(ctx, ev)
 	}
+	// 3. MessageRead
 	if ev, ok := MessageReadFromUpdate(ctx, u); ok {
 		return d.Dispatch(ctx, ev)
 	}
-	// Fall through: wrap in Raw so catch-all handlers still see it.
+	// 4. ChatAction
+	if ev, ok := ChatActionFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	// 5. UserUpdate
+	if ev, ok := UserUpdateFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	// 6. CallbackQuery
+	if ev, ok := CallbackQueryFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	// 7. InlineQuery
+	if ev, ok := InlineQueryFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	// 8. JoinRequest
+	if ev, ok := JoinRequestFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	// 9. Raw catch-all
 	return d.Dispatch(ctx, &Raw{Update: u})
+}
+
+// handleUpdates expands an *tg.Updates container and dispatches each update.
+func (d *Dispatcher) handleUpdates(ctx context.Context, updates *tg.Updates) error {
+	for _, u := range updates.Updates {
+		if err := d.HandleUpdate(ctx, u); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// handleUpdatesCombined expands an *tg.UpdatesCombined container and dispatches each update.
+func (d *Dispatcher) handleUpdatesCombined(ctx context.Context, updates *tg.UpdatesCombined) error {
+	for _, u := range updates.Updates {
+		if err := d.HandleUpdate(ctx, u); err != nil {
+			return err
+		}
+	}
+	return nil
 }

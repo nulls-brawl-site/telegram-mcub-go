@@ -284,6 +284,148 @@ func (c *MCUBClient) IterTopicMessages(
 	return nil
 }
 
+// CloseTopic closes a forum topic so that no new messages can be posted.
+func (c *MCUBClient) CloseTopic(ctx context.Context, channelID int64, topicID int) error {
+	channel, err := c.resolveInputChannel(ctx, channelID)
+	if err != nil {
+		return fmt.Errorf("resolve channel: %w", err)
+	}
+	req := &tg.ChannelsEditForumTopicRequest{
+		Channel: channel,
+		TopicID: topicID,
+	}
+	req.SetClosed(true)
+	_, err = c.client.API().ChannelsEditForumTopic(ctx, req)
+	if err != nil {
+		return fmt.Errorf("close topic %d: %w", topicID, err)
+	}
+	return nil
+}
+
+// ReopenTopic reopens a closed forum topic.
+func (c *MCUBClient) ReopenTopic(ctx context.Context, channelID int64, topicID int) error {
+	channel, err := c.resolveInputChannel(ctx, channelID)
+	if err != nil {
+		return fmt.Errorf("resolve channel: %w", err)
+	}
+	req := &tg.ChannelsEditForumTopicRequest{
+		Channel: channel,
+		TopicID: topicID,
+	}
+	req.SetClosed(false)
+	_, err = c.client.API().ChannelsEditForumTopic(ctx, req)
+	if err != nil {
+		return fmt.Errorf("reopen topic %d: %w", topicID, err)
+	}
+	return nil
+}
+
+// DeleteTopicHistory deletes the message history of a forum topic.
+// topicID is the ID of the topic (same as its first/top message ID).
+func (c *MCUBClient) DeleteTopicHistory(ctx context.Context, channelID int64, topicID int) (*tg.MessagesAffectedHistory, error) {
+	channel, err := c.resolveInputChannel(ctx, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve channel: %w", err)
+	}
+	result, err := c.client.API().ChannelsDeleteTopicHistory(ctx, &tg.ChannelsDeleteTopicHistoryRequest{
+		Channel:  channel,
+		TopMsgID: topicID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("delete topic history %d: %w", topicID, err)
+	}
+	return result, nil
+}
+
+// PinTopic pins or unpins a forum topic in the topic list.
+func (c *MCUBClient) PinTopic(ctx context.Context, channelID int64, topicID int, pinned bool) error {
+	channel, err := c.resolveInputChannel(ctx, channelID)
+	if err != nil {
+		return fmt.Errorf("resolve channel: %w", err)
+	}
+	_, err = c.client.API().ChannelsUpdatePinnedForumTopic(ctx, &tg.ChannelsUpdatePinnedForumTopicRequest{
+		Channel: channel,
+		TopicID: topicID,
+		Pinned:  pinned,
+	})
+	if err != nil {
+		return fmt.Errorf("pin/unpin topic %d: %w", topicID, err)
+	}
+	return nil
+}
+
+// ReorderTopics reorders pinned forum topics.
+// topicIDs lists the topic IDs in the desired order.
+// Pass force=true to unpin any topics not present in topicIDs.
+func (c *MCUBClient) ReorderTopics(ctx context.Context, channelID int64, topicIDs []int, force bool) error {
+	channel, err := c.resolveInputChannel(ctx, channelID)
+	if err != nil {
+		return fmt.Errorf("resolve channel: %w", err)
+	}
+	req := &tg.ChannelsReorderPinnedForumTopicsRequest{
+		Channel: channel,
+		Order:   topicIDs,
+	}
+	if force {
+		req.Force = true
+	}
+	_, err = c.client.API().ChannelsReorderPinnedForumTopics(ctx, req)
+	if err != nil {
+		return fmt.Errorf("reorder topics: %w", err)
+	}
+	return nil
+}
+
+// GetTopic returns a single forum topic by its topic ID.
+// Returns nil if the topic was not found.
+func (c *MCUBClient) GetTopic(ctx context.Context, channelID int64, topicID int) (*Topic, error) {
+	topics, err := c.getTopicsByIDs(ctx, channelID, []int{topicID})
+	if err != nil {
+		return nil, err
+	}
+	if len(topics) == 0 {
+		return nil, nil
+	}
+	return topics[0], nil
+}
+
+// SetTopicIcon changes the custom emoji icon of a forum topic.
+// Pass emojiID=0 to reset to the default icon.
+func (c *MCUBClient) SetTopicIcon(ctx context.Context, channelID int64, topicID int, emojiID int64) error {
+	channel, err := c.resolveInputChannel(ctx, channelID)
+	if err != nil {
+		return fmt.Errorf("resolve channel: %w", err)
+	}
+	req := &tg.ChannelsEditForumTopicRequest{
+		Channel: channel,
+		TopicID: topicID,
+	}
+	req.SetIconEmojiID(emojiID)
+	_, err = c.client.API().ChannelsEditForumTopic(ctx, req)
+	if err != nil {
+		return fmt.Errorf("set topic icon %d: %w", topicID, err)
+	}
+	return nil
+}
+
+// EditTopicTitle renames a forum topic.
+func (c *MCUBClient) EditTopicTitle(ctx context.Context, channelID int64, topicID int, title string) error {
+	channel, err := c.resolveInputChannel(ctx, channelID)
+	if err != nil {
+		return fmt.Errorf("resolve channel: %w", err)
+	}
+	req := &tg.ChannelsEditForumTopicRequest{
+		Channel: channel,
+		TopicID: topicID,
+	}
+	req.SetTitle(title)
+	_, err = c.client.API().ChannelsEditForumTopic(ctx, req)
+	if err != nil {
+		return fmt.Errorf("edit topic title %d: %w", topicID, err)
+	}
+	return nil
+}
+
 // forumTopicsToTopics converts a slice of tg.ForumTopicClass to []*Topic.
 func forumTopicsToTopics(raw []tg.ForumTopicClass) []*Topic {
 	out := make([]*Topic, 0, len(raw))

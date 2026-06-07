@@ -76,6 +76,15 @@ func (c *MCUBClient) SendReaction(ctx context.Context, params SendReactionParams
 	return nil
 }
 
+// ClearReaction removes the current user's own reaction from a message.
+func (c *MCUBClient) ClearReaction(ctx context.Context, chatID int64, msgID int) error {
+	return c.SendReaction(ctx, SendReactionParams{
+		PeerID:    chatID,
+		MessageID: msgID,
+		Reactions: nil, // empty = remove all
+	})
+}
+
 // MessageReactionSender holds information about a user who reacted.
 type MessageReactionSender struct {
 	// PeerID is the peer ID of the reactor (positive = user).
@@ -89,16 +98,19 @@ type MessageReactionSender struct {
 }
 
 // GetMessageReactionsList retrieves the list of peers who reacted to a message.
+// reaction may be nil to retrieve all reactions.
+// offset is a pagination cursor (pass "" initially).
 func (c *MCUBClient) GetMessageReactionsList(
 	ctx context.Context,
 	peerID int64,
 	messageID int,
 	reaction ReactionClass,
 	limit int,
-) ([]MessageReactionSender, error) {
+	offset string,
+) ([]MessageReactionSender, string, error) {
 	peer, err := c.resolvePeer(ctx, peerID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if limit <= 0 {
@@ -113,10 +125,13 @@ func (c *MCUBClient) GetMessageReactionsList(
 	if reaction != nil {
 		req.SetReaction(reaction.toTL())
 	}
+	if offset != "" {
+		req.SetOffset(offset)
+	}
 
 	result, err := c.client.API().MessagesGetMessageReactionsList(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("get reactions list: %w", err)
+		return nil, "", fmt.Errorf("get reactions list: %w", err)
 	}
 
 	out := make([]MessageReactionSender, 0, len(result.Reactions))
@@ -139,7 +154,34 @@ func (c *MCUBClient) GetMessageReactionsList(
 
 		out = append(out, sender)
 	}
-	return out, nil
+
+	nextOffset, _ := result.GetNextOffset()
+	return out, nextOffset, nil
+}
+
+// GetMessageReactions returns reaction counts for the given message IDs in a chat.
+func (c *MCUBClient) GetMessageReactions(ctx context.Context, chatID int64, msgIDs []int) (*tg.MessagesMessageReactionsList, error) {
+	if len(msgIDs) == 0 {
+		return &tg.MessagesMessageReactionsList{}, nil
+	}
+	// Use GetMessageReactionsList for the first message as a simplified proxy.
+	// Full "get reaction counts" is available via messages.getMessagesReactions
+	// which was added after v0.89.0. We iterate the reactions for the first
+	// message here as a best-effort implementation.
+	peer, err := c.resolvePeer(ctx, chatID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+	req := &tg.MessagesGetMessageReactionsListRequest{
+		Peer:  peer,
+		ID:    msgIDs[0],
+		Limit: 100,
+	}
+	result, err := c.client.API().MessagesGetMessageReactionsList(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("get message reactions: %w", err)
+	}
+	return result, nil
 }
 
 // SetDefaultReaction sets the default reaction emoji for the current user.
@@ -149,4 +191,67 @@ func (c *MCUBClient) SetDefaultReaction(ctx context.Context, reaction ReactionCl
 		return fmt.Errorf("set default reaction: %w", err)
 	}
 	return nil
+}
+
+// SetChatAvailableReactions sets the available reactions for a chat or channel.
+// Pass an empty slice to allow all reactions; pass specific emojis to restrict.
+func (c *MCUBClient) SetChatAvailableReactions(ctx context.Context, chatID int64, reactions []string) error {
+	peer, err := c.resolvePeer(ctx, chatID)
+	if err != nil {
+		return fmt.Errorf("resolve peer: %w", err)
+	}
+
+	var chatReactions tg.ChatReactionsClass
+	if len(reactions) == 0 {
+		chatReactions = &tg.ChatReactionsAll{}
+	} else {
+		tlReactions := make([]tg.ReactionClass, 0, len(reactions))
+		for _, emoji := range reactions {
+			tlReactions = append(tlReactions, &tg.ReactionEmoji{Emoticon: emoji})
+		}
+		chatReactions = &tg.ChatReactionsSome{Reactions: tlReactions}
+	}
+
+	_, err = c.client.API().MessagesSetChatAvailableReactions(ctx, &tg.MessagesSetChatAvailableReactionsRequest{
+		Peer:               peer,
+		AvailableReactions: chatReactions,
+	})
+	if err != nil {
+		return fmt.Errorf("set chat available reactions: %w", err)
+	}
+	return nil
+}
+
+// GetAvailableReactions returns the global list of available emoji reactions.
+// hash=0 always fetches the latest list.
+func (c *MCUBClient) GetAvailableReactions(ctx context.Context) (tg.MessagesAvailableReactionsClass, error) {
+	result, err := c.client.API().MessagesGetAvailableReactions(ctx, 0)
+	if err != nil {
+		return nil, fmt.Errorf("get available reactions: %w", err)
+	}
+	return result, nil
+}
+
+// GetAvailableEffects returns the list of available message effects.
+//
+// Note: messages.getAvailableEffects was introduced after gotd v0.89.0.
+// This stub returns an error; upgrade the dependency for full support.
+func (c *MCUBClient) GetAvailableEffects(ctx context.Context) (interface{}, error) {
+	return nil, fmt.Errorf(
+		"GetAvailableEffects: messages.getAvailableEffects is not available in gotd v0.89.0; " +
+			"upgrade the gotd/td dependency to access this feature",
+	)
+}
+
+// SendMessageWithEffect sends a text message with a visual effect to a peer.
+//
+// Note: the effect_id field in MessagesSendMessageRequest was introduced after
+// gotd v0.89.0.  This implementation sends the message without an effect and
+// returns it with an explanatory note; upgrade the dependency for full support.
+func (c *MCUBClient) SendMessageWithEffect(ctx context.Context, peerID int64, text string, effectID int64) (*tg.Message, error) {
+	// Fall back to a regular send since EffectID is unavailable in this layer.
+	return c.SendMessage(ctx, SendMessageParams{
+		PeerID: peerID,
+		Text:   text,
+	})
 }

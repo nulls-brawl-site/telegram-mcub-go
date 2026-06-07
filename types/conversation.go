@@ -26,11 +26,18 @@ type Conversation struct {
 	// incoming receives new inbound messages for this conversation.
 	incoming chan *tg.Message
 
+	// edits receives edited messages for this conversation.
+	edits chan *tg.Message
+
+	// reads receives max-read-ID notifications for this conversation.
+	reads chan int
+
 	// done is closed when the conversation is cancelled.
 	done chan struct{}
 
-	mu        sync.Mutex
-	cancelled bool
+	mu         sync.Mutex
+	cancelled  bool
+	sentMsgIDs []int // IDs of messages sent via SendMessage
 }
 
 // NewConversation creates a new Conversation for the given chat.
@@ -41,8 +48,31 @@ func NewConversation(client interface{}, chatID int64, timeout time.Duration) *C
 		chatID:   chatID,
 		timeout:  timeout,
 		incoming: make(chan *tg.Message, 64),
+		edits:    make(chan *tg.Message, 64),
+		reads:    make(chan int, 64),
 		done:     make(chan struct{}),
 	}
+}
+
+// Enter sets up the conversation for use. Call this before using the conversation,
+// or use it with defer c.Exit() for automatic cleanup.
+// If the conversation was previously cancelled, Enter re-initialises it.
+func (c *Conversation) Enter() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancelled {
+		c.cancelled = false
+		c.done = make(chan struct{})
+		c.incoming = make(chan *tg.Message, 64)
+		c.edits = make(chan *tg.Message, 64)
+		c.reads = make(chan int, 64)
+	}
+	c.sentMsgIDs = nil
+}
+
+// Exit tears down the conversation.  Typically called as defer c.Exit() after Enter.
+func (c *Conversation) Exit() {
+	c.Cancel()
 }
 
 // ChatID returns the chat ID this conversation is tied to.
@@ -65,7 +95,17 @@ func (c *Conversation) SendMessage(ctx context.Context, text string) (*tg.Messag
 	if !ok {
 		return nil, fmt.Errorf("client does not implement SendText")
 	}
-	return s.SendText(ctx, c.chatID, text)
+	msg, err := s.SendText(ctx, c.chatID, text)
+	if err != nil {
+		return nil, err
+	}
+	// Track sent message ID for reply waiting.
+	if msg != nil {
+		c.mu.Lock()
+		c.sentMsgIDs = append(c.sentMsgIDs, msg.ID)
+		c.mu.Unlock()
+	}
+	return msg, nil
 }
 
 // GetResponse waits for the next incoming message (subject to timeout).
@@ -136,6 +176,69 @@ func (c *Conversation) MarkRead(ctx context.Context) error {
 	return r.MarkRead(ctx, c.chatID)
 }
 
+// GetEdit waits for an edited message to arrive in this conversation (subject to timeout).
+func (c *Conversation) GetEdit(ctx context.Context) (*tg.Message, error) {
+	if c.isCancelled() {
+		return nil, fmt.Errorf("conversation cancelled")
+	}
+
+	deadline := time.Now().Add(c.timeout)
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.done:
+			return nil, fmt.Errorf("conversation cancelled")
+		case <-timer.C:
+			return nil, fmt.Errorf("conversation timed out after %s", c.timeout)
+		case msg, ok := <-c.edits:
+			if !ok {
+				return nil, fmt.Errorf("conversation edits channel closed")
+			}
+			return msg, nil
+		}
+	}
+}
+
+// WaitRead waits until the given message ID has been read by the other party.
+func (c *Conversation) WaitRead(ctx context.Context, msgID int) error {
+	if c.isCancelled() {
+		return fmt.Errorf("conversation cancelled")
+	}
+
+	deadline := time.Now().Add(c.timeout)
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.done:
+			return fmt.Errorf("conversation cancelled")
+		case <-timer.C:
+			return fmt.Errorf("conversation timed out after %s", c.timeout)
+		case maxID, ok := <-c.reads:
+			if !ok {
+				return fmt.Errorf("conversation reads channel closed")
+			}
+			if maxID >= msgID {
+				return nil
+			}
+		}
+	}
+}
+
+// SetTimeout changes the per-operation timeout for this conversation.
+func (c *Conversation) SetTimeout(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.timeout = d
+}
+
 // Deliver delivers an incoming message to the conversation's internal queue.
 // This is intended to be called by the event dispatcher.
 func (c *Conversation) Deliver(msg *tg.Message) {
@@ -146,6 +249,30 @@ func (c *Conversation) Deliver(msg *tg.Message) {
 	case c.incoming <- msg:
 	default:
 		// Drop if the buffer is full; callers should not flood a single conversation.
+	}
+}
+
+// DeliverEdit delivers an edited message to the conversation's edits queue.
+// This is intended to be called by the event dispatcher.
+func (c *Conversation) DeliverEdit(msg *tg.Message) {
+	if c.isCancelled() {
+		return
+	}
+	select {
+	case c.edits <- msg:
+	default:
+	}
+}
+
+// DeliverRead delivers a max-read-ID notification to the conversation's reads queue.
+// This is intended to be called by the event dispatcher when outbox read events arrive.
+func (c *Conversation) DeliverRead(maxID int) {
+	if c.isCancelled() {
+		return
+	}
+	select {
+	case c.reads <- maxID:
+	default:
 	}
 }
 

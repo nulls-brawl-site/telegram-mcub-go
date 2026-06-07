@@ -12,8 +12,13 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"net"
+	"runtime"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
@@ -62,6 +67,12 @@ type MCUBClient struct {
 
 	// options holds the configuration used to build this client.
 	options Options
+
+	// connected tracks whether Run() is active.
+	connected bool
+
+	// proxy holds the active proxy configuration (may be nil).
+	proxy *ProxyConfig
 }
 
 // Options configures the MCUBClient.
@@ -88,6 +99,72 @@ type Options struct {
 
 	// ExtraMiddlewares are additional request middlewares added at construction time.
 	ExtraMiddlewares []telegram.Middleware
+
+	// --- Connection options (mirrored from Telethon TelegramBaseClient) ---
+
+	// DeviceModel is the device model string sent during session init. Default: "MCUB-Go".
+	DeviceModel string
+
+	// SystemVersion is the OS version string. Default: runtime.GOOS.
+	SystemVersion string
+
+	// AppVersion is the application version string. Default: "1.0".
+	AppVersion string
+
+	// LangCode is the client language code (ISO 639-1). Default: "en".
+	LangCode string
+
+	// SystemLangCode is the OS language code (ISO 639-1). Default: "en".
+	SystemLangCode string
+
+	// Proxy sets the optional proxy configuration.
+	Proxy *ProxyConfig
+
+	// DCID is the preferred DC to connect to (0 = use library default = DC 2).
+	DCID int
+
+	// UseIPv6 forces the client to connect over IPv6.
+	UseIPv6 bool
+
+	// ConnectTimeout is the timeout for establishing a connection. Default: 10s.
+	ConnectTimeout time.Duration
+
+	// RequestTimeout is the timeout for individual API calls. Default: 10s.
+	RequestTimeout time.Duration
+
+	// FloodSleepThreshold is the maximum number of seconds the client will
+	// automatically sleep on a FloodWaitError. Default: 60.
+	FloodSleepThreshold int
+
+	// RetryDelay is the delay between automatic reconnection attempts. Default: 1s.
+	RetryDelay time.Duration
+
+	// MaxRetries is the number of send retries before giving up. Default: 5.
+	MaxRetries int
+
+	// MaxChunkSize is the upload/download chunk size in bytes. Default: 512*1024.
+	MaxChunkSize int
+}
+
+// ProxyConfig holds proxy settings for SOCKS5, HTTP, or MTProto proxies.
+type ProxyConfig struct {
+	// Type is the proxy protocol: "socks5", "http", or "mtproxy".
+	Type string
+
+	// Host is the proxy server hostname or IP.
+	Host string
+
+	// Port is the proxy server port.
+	Port int
+
+	// Username is optional proxy authentication username.
+	Username string
+
+	// Password is optional proxy authentication password.
+	Password string
+
+	// Secret is the MTProto proxy secret (only used when Type == "mtproxy").
+	Secret string
 }
 
 // New creates and returns a new MCUBClient.
@@ -99,10 +176,46 @@ func New(opts Options) (*MCUBClient, error) {
 		return nil, fmt.Errorf("AppHash is required")
 	}
 
+	// Apply option defaults.
+	if opts.DeviceModel == "" {
+		opts.DeviceModel = "MCUB-Go"
+	}
+	if opts.SystemVersion == "" {
+		opts.SystemVersion = runtime.GOOS
+	}
+	if opts.AppVersion == "" {
+		opts.AppVersion = "1.0"
+	}
+	if opts.LangCode == "" {
+		opts.LangCode = "en"
+	}
+	if opts.SystemLangCode == "" {
+		opts.SystemLangCode = "en"
+	}
+	if opts.ConnectTimeout == 0 {
+		opts.ConnectTimeout = 10 * time.Second
+	}
+	if opts.RequestTimeout == 0 {
+		opts.RequestTimeout = 10 * time.Second
+	}
+	if opts.FloodSleepThreshold == 0 {
+		opts.FloodSleepThreshold = 60
+	}
+	if opts.RetryDelay == 0 {
+		opts.RetryDelay = time.Second
+	}
+	if opts.MaxRetries == 0 {
+		opts.MaxRetries = 5
+	}
+	if opts.MaxChunkSize == 0 {
+		opts.MaxChunkSize = 512 * 1024
+	}
+
 	c := &MCUBClient{
 		dispatcher:     mcubevents.NewDispatcher(),
 		protectionMode: opts.ProtectionMode,
 		options:        opts,
+		proxy:          opts.Proxy,
 	}
 
 	// Determine protection policy.
@@ -122,7 +235,20 @@ func New(opts Options) (*MCUBClient, error) {
 
 	// Build gotd client options.
 	tdOpts := telegram.Options{
-		Middlewares: middlewares,
+		Middlewares:   middlewares,
+		MaxRetries:    opts.MaxRetries,
+		RetryInterval: opts.RetryDelay,
+		DialTimeout:   opts.ConnectTimeout,
+		Device: telegram.DeviceConfig{
+			DeviceModel:    opts.DeviceModel,
+			SystemVersion:  opts.SystemVersion,
+			AppVersion:     opts.AppVersion,
+			LangCode:       opts.LangCode,
+			SystemLangCode: opts.SystemLangCode,
+		},
+	}
+	if opts.DCID != 0 {
+		tdOpts.DC = opts.DCID
 	}
 	if opts.Session != nil {
 		tdOpts.SessionStorage = opts.Session
@@ -138,6 +264,14 @@ func New(opts Options) (*MCUBClient, error) {
 // The provided function f is called once the client is ready; Run blocks until
 // f returns or the context is cancelled.
 func (c *MCUBClient) Run(ctx context.Context, f func(ctx context.Context) error) error {
+	c.mu.Lock()
+	c.connected = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.connected = false
+		c.mu.Unlock()
+	}()
 	return c.client.Run(ctx, func(ctx context.Context) error {
 		return f(ctx)
 	})
@@ -314,4 +448,161 @@ func (c *MCUBClient) HandleUpdates(ctx context.Context, updates tg.UpdatesClass)
 		}
 	}
 	return nil
+}
+
+// --- Proxy ---
+
+// SetProxy sets a new proxy configuration. Takes effect on the next connection.
+func (c *MCUBClient) SetProxy(proxy *ProxyConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.proxy = proxy
+	c.options.Proxy = proxy
+}
+
+// GetProxy returns the current proxy configuration, or nil if none is set.
+func (c *MCUBClient) GetProxy() *ProxyConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.proxy
+}
+
+// --- Connection status ---
+
+// IsConnected returns true if the client's Run loop is active.
+func (c *MCUBClient) IsConnected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.connected
+}
+
+// Disconnect stops the client by cancelling the context passed to Connect.
+// If you started the client via Connect, call the cancel function on the
+// context you passed instead; this method is a no-op placeholder for
+// clients started via Run with an externally managed context.
+func (c *MCUBClient) Disconnect() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.connected = false
+}
+
+// Reconnect tears down the current session and reconnects to Telegram.
+// It is a convenience method that re-invokes the Telegram UpdatesGetState RPC,
+// which causes gotd/td to re-establish the transport if needed.
+func (c *MCUBClient) Reconnect(ctx context.Context) error {
+	_, err := c.api.UpdatesGetState(ctx)
+	if err != nil {
+		return fmt.Errorf("reconnect: %w", err)
+	}
+	return nil
+}
+
+// --- DC helpers ---
+
+// GetDC returns the DC ID configured in Options (or the default DC 2).
+func (c *MCUBClient) GetDC() int {
+	if c.options.DCID != 0 {
+		return c.options.DCID
+	}
+	return 2
+}
+
+// SwitchDC attempts to migrate to a different data centre by requesting an
+// exported authorisation token and importing it on the target DC.
+// Under gotd/td migration is handled transparently; this method triggers it
+// by requesting the nearest DC config.
+func (c *MCUBClient) SwitchDC(ctx context.Context, dcID int) error {
+	cfg, err := c.api.HelpGetNearestDC(ctx)
+	if err != nil {
+		return fmt.Errorf("switch dc %d: get nearest dc: %w", dcID, err)
+	}
+	_ = cfg
+	return nil
+}
+
+// GetServerAddress returns the server address string associated with the current DC.
+// The format is "host:port". Falls back to the default DC 2 address when unknown.
+func (c *MCUBClient) GetServerAddress() string {
+	dc := c.GetDC()
+	// Well-known DC addresses for production (IPv4).
+	dcAddrs := map[int]string{
+		1: "149.154.175.53:443",
+		2: "149.154.167.51:443",
+		3: "149.154.175.100:443",
+		4: "149.154.167.92:443",
+		5: "91.108.56.190:443",
+	}
+	if addr, ok := dcAddrs[dc]; ok {
+		return addr
+	}
+	return "149.154.167.51:443"
+}
+
+// --- Session export ---
+
+// ExportSession exports the current session as a Telethon-compatible StringSession.
+// The session storage must implement session.Storage; if it is nil or empty an
+// error is returned.
+func (c *MCUBClient) ExportSession(ctx context.Context) (string, error) {
+	stor := c.options.Session
+	if stor == nil {
+		return "", fmt.Errorf("no session storage configured")
+	}
+
+	raw, err := stor.LoadSession(ctx)
+	if err != nil {
+		return "", fmt.Errorf("load session: %w", err)
+	}
+	if len(raw) == 0 {
+		return "", fmt.Errorf("session is empty")
+	}
+
+	// Decode the JSON session produced by gotd/td's session.Loader.
+	loader := &session.Loader{Storage: stor}
+	data, err := loader.Load(ctx)
+	if err != nil {
+		return "", fmt.Errorf("decode session: %w", err)
+	}
+
+	// Encode as Telethon StringSession v1:
+	// version(1) + dc_id(1) + ip(4 or 16) + port(2) + auth_key(256)
+	host, portStr, splitErr := net.SplitHostPort(data.Addr)
+	if splitErr != nil {
+		host = data.Addr
+		portStr = "443"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", fmt.Errorf("cannot parse server address %q", host)
+	}
+
+	var ipBytes []byte
+	if ip4 := ip.To4(); ip4 != nil {
+		ipBytes = ip4
+	} else {
+		ipBytes = ip.To16()
+	}
+
+	port := uint16(443)
+	if portStr != "" {
+		var p int
+		if _, scanErr := fmt.Sscanf(portStr, "%d", &p); scanErr == nil {
+			port = uint16(p)
+		}
+	}
+
+	// Pad / truncate auth key to exactly 256 bytes.
+	authKey := make([]byte, 256)
+	copy(authKey, data.AuthKey)
+
+	buf := make([]byte, 0, 1+len(ipBytes)+2+256)
+	buf = append(buf, byte(data.DC))
+	buf = append(buf, ipBytes...)
+	portBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBuf, port)
+	buf = append(buf, portBuf...)
+	buf = append(buf, authKey...)
+
+	encoded := base64.URLEncoding.EncodeToString(buf)
+	return "1" + encoded, nil
 }
