@@ -102,3 +102,26 @@ func middlewareFuncPtr(_ MiddlewareFunc) uintptr {
 
 // UpdateClass is an alias to make imports more ergonomic.
 type UpdateClass = tg.UpdateClass
+
+// HandleUpdate converts a raw TG update into the most specific event type
+// available and dispatches it.  Unrecognised updates are wrapped in Raw and
+// dispatched so catch-all handlers still fire.
+func (d *Dispatcher) HandleUpdate(ctx context.Context, u tg.UpdateClass) error {
+	if ev, ok := NewMessageFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	if ev, ok := ChatActionFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	if ev, ok := UserUpdateFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	if ev, ok := MessageDeletedFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	if ev, ok := MessageReadFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
+	// Fall through: wrap in Raw so catch-all handlers still see it.
+	return d.Dispatch(ctx, &Raw{Update: u})
+}

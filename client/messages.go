@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 
 	"github.com/gotd/td/tg"
 	"github.com/nulls-brawl-site/telegram-mcub-go/types"
@@ -458,4 +459,394 @@ func extractMessages(result tg.MessagesMessagesClass) []*tg.Message {
 		}
 	}
 	return out
+}
+
+// --- Additional message methods (ported from Telethon-MCUB) ---
+
+// SearchParams holds parameters for searching messages.
+type SearchParams struct {
+	// PeerID is the peer to search within. Use 0 for global search.
+	PeerID int64
+	// Query is the search text.
+	Query string
+	// Limit is the maximum number of results to return.
+	Limit int
+	// OffsetID is the message ID to start from.
+	OffsetID int
+	// FromID restricts results to messages sent by this user.
+	FromID int64
+	// Filter restricts by media type: "photo", "video", "document", "url", "audio", "voice", "music".
+	Filter string
+	// MinDate is the minimum message date (Unix timestamp).
+	MinDate int
+	// MaxDate is the maximum message date (Unix timestamp).
+	MaxDate int
+}
+
+// HistoryParams holds parameters for fetching message history.
+type HistoryParams struct {
+	// Limit is the maximum number of messages to return.
+	Limit int
+	// OffsetID is the message ID to start from.
+	OffsetID int
+	// OffsetDate restricts to messages before this date (Unix timestamp).
+	OffsetDate int
+	// MaxID returns only messages with ID less than this value.
+	MaxID int
+	// MinID returns only messages with ID greater than this value.
+	MinID int
+	// AddOffset is an additional negative offset.
+	AddOffset int
+	// Hash is used for caching; pass 0 to disable.
+	Hash int64
+	// Reverse returns messages in ascending order (oldest first).
+	Reverse bool
+}
+
+// searchFilterFromString converts a filter name to a tg.MessagesFilterClass.
+func searchFilterFromString(filter string) tg.MessagesFilterClass {
+	switch filter {
+	case "photo":
+		return &tg.InputMessagesFilterPhotos{}
+	case "video":
+		return &tg.InputMessagesFilterVideo{}
+	case "document":
+		return &tg.InputMessagesFilterDocument{}
+	case "url":
+		return &tg.InputMessagesFilterURL{}
+	case "audio", "music":
+		return &tg.InputMessagesFilterMusic{}
+	case "voice":
+		return &tg.InputMessagesFilterVoice{}
+	default:
+		return &tg.InputMessagesFilterEmpty{}
+	}
+}
+
+// SearchMessages searches messages within a peer or globally.
+// Set params.PeerID to 0 to perform a global search.
+func (c *MCUBClient) SearchMessages(ctx context.Context, params SearchParams) ([]*tg.Message, error) {
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	if params.PeerID == 0 {
+		// Global search.
+		result, err := c.api.MessagesSearchGlobal(ctx, &tg.MessagesSearchGlobalRequest{
+			Q:        params.Query,
+			Filter:   searchFilterFromString(params.Filter),
+			MinDate:  params.MinDate,
+			MaxDate:  params.MaxDate,
+			OffsetID: params.OffsetID,
+			Limit:    limit,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("search global: %w", err)
+		}
+		return extractMessages(result), nil
+	}
+
+	peer, err := c.resolvePeer(ctx, params.PeerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	req := &tg.MessagesSearchRequest{
+		Peer:     peer,
+		Q:        params.Query,
+		Filter:   searchFilterFromString(params.Filter),
+		MinDate:  params.MinDate,
+		MaxDate:  params.MaxDate,
+		OffsetID: params.OffsetID,
+		Limit:    limit,
+	}
+
+	if params.FromID != 0 {
+		req.SetFromID(&tg.InputPeerUser{UserID: params.FromID})
+	}
+
+	result, err := c.api.MessagesSearch(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	return extractMessages(result), nil
+}
+
+// GetHistory returns the message history for a peer.
+func (c *MCUBClient) GetHistory(ctx context.Context, peerID int64, params HistoryParams) ([]*tg.Message, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	result, err := c.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		Peer:       peer,
+		OffsetID:   params.OffsetID,
+		OffsetDate: params.OffsetDate,
+		AddOffset:  params.AddOffset,
+		Limit:      limit,
+		MaxID:      params.MaxID,
+		MinID:      params.MinID,
+		Hash:       params.Hash,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get history: %w", err)
+	}
+
+	msgs := extractMessages(result)
+
+	if params.Reverse {
+		for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+			msgs[i], msgs[j] = msgs[j], msgs[i]
+		}
+	}
+
+	return msgs, nil
+}
+
+// DeleteMessages deletes messages by their IDs in the given peer.
+// For channels/supergroups the peer is required; for other chats revoke controls
+// whether to delete for everyone.
+func (c *MCUBClient) DeleteMessages(ctx context.Context, peerID int64, ids []int, revoke bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	if peerID < -999999999 {
+		chanID := channelIDFromPeerID(peerID)
+		_, err := c.api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{
+			Channel: &tg.InputChannel{ChannelID: chanID},
+			ID:      ids,
+		})
+		return err
+	}
+
+	_, err := c.api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
+		Revoke: revoke,
+		ID:     ids,
+	})
+	return err
+}
+
+// MarkAsRead marks messages up to maxID as read in the given peer.
+// Pass maxID = 0 to mark all messages as read.
+func (c *MCUBClient) MarkAsRead(ctx context.Context, peerID int64, maxID int) error {
+	if peerID < -999999999 {
+		chanID := channelIDFromPeerID(peerID)
+		_, err := c.api.ChannelsReadHistory(ctx, &tg.ChannelsReadHistoryRequest{
+			Channel: &tg.InputChannel{ChannelID: chanID},
+			MaxID:   maxID,
+		})
+		return err
+	}
+
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("resolve peer: %w", err)
+	}
+	_, err = c.api.MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{
+		Peer:  peer,
+		MaxID: maxID,
+	})
+	return err
+}
+
+// SendVoice uploads and sends a voice message to the given peer.
+func (c *MCUBClient) SendVoice(ctx context.Context, peerID int64, filePath string, caption string) (*tg.Message, error) {
+	uploaded, err := c.uploadFile(ctx, UploadParams{Path: filePath})
+	if err != nil {
+		return nil, fmt.Errorf("upload voice: %w", err)
+	}
+
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	media := &tg.InputMediaUploadedDocument{
+		File:     uploaded.InputFile,
+		MimeType: "audio/ogg",
+		Attributes: []tg.DocumentAttributeClass{
+			&tg.DocumentAttributeAudio{
+				Voice:    true,
+				Duration: 0,
+			},
+		},
+	}
+
+	result, err := c.api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+		Peer:     peer,
+		Media:    media,
+		Message:  caption,
+		RandomID: rand.Int63(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("send voice: %w", err)
+	}
+	return extractMessageFromUpdates(result), nil
+}
+
+// SendSticker uploads and sends a sticker file to the given peer.
+func (c *MCUBClient) SendSticker(ctx context.Context, peerID int64, filePath string) (*tg.Message, error) {
+	uploaded, err := c.uploadFile(ctx, UploadParams{Path: filePath})
+	if err != nil {
+		return nil, fmt.Errorf("upload sticker: %w", err)
+	}
+
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	ext := filepath.Ext(filePath)
+	mime := "image/webp"
+	if ext == ".tgs" {
+		mime = "application/x-tgsticker"
+	} else if ext == ".webm" {
+		mime = "video/webm"
+	}
+
+	media := &tg.InputMediaUploadedDocument{
+		File:     uploaded.InputFile,
+		MimeType: mime,
+		Attributes: []tg.DocumentAttributeClass{
+			&tg.DocumentAttributeSticker{
+				Alt:      "",
+				Stickerset: &tg.InputStickerSetEmpty{},
+			},
+		},
+	}
+
+	result, err := c.api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+		Peer:     peer,
+		Media:    media,
+		RandomID: rand.Int63(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("send sticker: %w", err)
+	}
+	return extractMessageFromUpdates(result), nil
+}
+
+// SendDice sends a dice message with the given emoji (e.g. "🎲", "🎯", "🏀").
+func (c *MCUBClient) SendDice(ctx context.Context, peerID int64, emoji string) (*tg.Message, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	result, err := c.api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+		Peer: peer,
+		Media: &tg.InputMediaDice{
+			Emoticon: emoji,
+		},
+		RandomID: rand.Int63(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("send dice: %w", err)
+	}
+	return extractMessageFromUpdates(result), nil
+}
+
+// GetScheduledMessages returns all scheduled messages for the given peer.
+func (c *MCUBClient) GetScheduledMessages(ctx context.Context, peerID int64) ([]*tg.Message, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	result, err := c.api.MessagesGetScheduledHistory(ctx, &tg.MessagesGetScheduledHistoryRequest{
+		Peer: peer,
+		Hash: 0,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get scheduled messages: %w", err)
+	}
+	return extractMessages(result), nil
+}
+
+// SendScheduledMessage sends a previously scheduled message immediately.
+func (c *MCUBClient) SendScheduledMessage(ctx context.Context, peerID int64, msgID int) error {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("resolve peer: %w", err)
+	}
+
+	_, err = c.api.MessagesSendScheduledMessages(ctx, &tg.MessagesSendScheduledMessagesRequest{
+		Peer: peer,
+		ID:   []int{msgID},
+	})
+	if err != nil {
+		return fmt.Errorf("send scheduled message: %w", err)
+	}
+	return nil
+}
+
+// DeleteScheduledMessages deletes scheduled messages by their IDs.
+func (c *MCUBClient) DeleteScheduledMessages(ctx context.Context, peerID int64, ids []int) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("resolve peer: %w", err)
+	}
+
+	_, err = c.api.MessagesDeleteScheduledMessages(ctx, &tg.MessagesDeleteScheduledMessagesRequest{
+		Peer: peer,
+		ID:   ids,
+	})
+	if err != nil {
+		return fmt.Errorf("delete scheduled messages: %w", err)
+	}
+	return nil
+}
+
+// TranslateMessage translates a message to the target language.
+// Returns the translated text. toLang is a two-letter ISO 639-1 code (e.g. "en", "ru").
+func (c *MCUBClient) TranslateMessage(ctx context.Context, peerID int64, msgID int, toLang string) (string, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return "", fmt.Errorf("resolve peer: %w", err)
+	}
+
+	req := &tg.MessagesTranslateTextRequest{
+		ToLang: toLang,
+	}
+	req.SetPeer(peer)
+	req.SetID([]int{msgID})
+
+	result, err := c.api.MessagesTranslateText(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("translate message: %w", err)
+	}
+
+	if result == nil || len(result.Result) == 0 {
+		return "", nil
+	}
+	return result.Result[0].Text, nil
+}
+
+// GetMessageLink returns the t.me link for a message in a channel or supergroup.
+func (c *MCUBClient) GetMessageLink(ctx context.Context, peerID int64, msgID int) (string, error) {
+	channel, err := c.resolveInputChannel(ctx, peerID)
+	if err != nil {
+		return "", fmt.Errorf("resolve channel: %w", err)
+	}
+
+	result, err := c.api.ChannelsExportMessageLink(ctx, &tg.ChannelsExportMessageLinkRequest{
+		Channel: channel,
+		ID:      msgID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("get message link: %w", err)
+	}
+	return result.Link, nil
 }
