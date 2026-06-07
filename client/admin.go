@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/gotd/td/tg"
+
+	"github.com/nulls-brawl-site/telegram-mcub-go/types"
 )
 
 // BanUser permanently bans a user from a channel or supergroup.
@@ -206,4 +208,41 @@ func peerToUserID(peer tg.PeerClass) int64 {
 		return int64(p.UserID)
 	}
 	return 0
+}
+
+// GetAdminLog fetches the admin log for a channel or supergroup.
+// Filters and pagination are controlled via params.
+func (c *MCUBClient) GetAdminLog(ctx context.Context, params types.GetAdminLogParams) ([]*types.AdminLogEvent, error) {
+	channel, err := c.resolveInputChannel(ctx, params.ChannelID)
+	if err != nil {
+		return nil, err
+	}
+
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	req := &tg.ChannelsGetAdminLogRequest{
+		Channel: channel,
+		Q:       params.Query,
+		MaxID:   params.MaxID,
+		MinID:   params.MinID,
+		Limit:   limit,
+	}
+
+	if f := params.ToTLEventsFilter(); f != nil {
+		req.SetEventsFilter(*f)
+	}
+
+	result, err := c.api.ChannelsGetAdminLog(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("get admin log for channel %d: %w", params.ChannelID, err)
+	}
+
+	events := make([]*types.AdminLogEvent, 0, len(result.Events))
+	for i := range result.Events {
+		events = append(events, types.NewAdminLogEvent(&result.Events[i]))
+	}
+	return events, nil
 }

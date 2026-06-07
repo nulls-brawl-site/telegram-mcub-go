@@ -57,6 +57,9 @@ type MCUBClient struct {
 	// mu guards mutable fields.
 	mu sync.RWMutex
 
+	// updCfg holds the active updates processing configuration.
+	updCfg UpdatesConfig
+
 	// options holds the configuration used to build this client.
 	options Options
 }
