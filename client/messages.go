@@ -183,6 +183,209 @@ func (c *MCUBClient) ForwardMessage(ctx context.Context, fromPeerID, toPeerID in
 	return err
 }
 
+// ForwardParams holds parameters for ForwardMessages.
+type ForwardParams struct {
+	// FromPeerID is the source chat.
+	FromPeerID int64
+
+	// ToPeerID is the destination chat.
+	ToPeerID int64
+
+	// MessageIDs are the IDs of the messages to forward.
+	MessageIDs []int
+
+	// Silent suppresses notifications in the destination chat.
+	Silent bool
+
+	// DropAuthor hides the original sender's name.
+	DropAuthor bool
+}
+
+// ForwardMessages forwards one or more messages from one chat to another.
+func (c *MCUBClient) ForwardMessages(ctx context.Context, params ForwardParams) ([]*tg.Message, error) {
+	fromPeer, err := c.resolvePeer(ctx, params.FromPeerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve from peer: %w", err)
+	}
+	toPeer, err := c.resolvePeer(ctx, params.ToPeerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve to peer: %w", err)
+	}
+
+	randomIDs := make([]int64, len(params.MessageIDs))
+	for i := range randomIDs {
+		randomIDs[i] = rand.Int63()
+	}
+
+	result, err := c.client.API().MessagesForwardMessages(ctx, &tg.MessagesForwardMessagesRequest{
+		FromPeer:    fromPeer,
+		ToPeer:      toPeer,
+		ID:          params.MessageIDs,
+		RandomID:    randomIDs,
+		Silent:      params.Silent,
+		DropAuthor:  params.DropAuthor,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("forward messages: %w", err)
+	}
+
+	// Collect forwarded messages from the updates.
+	var msgs []*tg.Message
+	switch u := result.(type) {
+	case *tg.Updates:
+		for _, upd := range u.Updates {
+			switch v := upd.(type) {
+			case *tg.UpdateNewMessage:
+				if m, ok := v.Message.(*tg.Message); ok {
+					msgs = append(msgs, m)
+				}
+			case *tg.UpdateNewChannelMessage:
+				if m, ok := v.Message.(*tg.Message); ok {
+					msgs = append(msgs, m)
+				}
+			}
+		}
+	}
+	return msgs, nil
+}
+
+// PinMessage pins a message in a chat.
+// If notify is true, participants receive a notification.
+func (c *MCUBClient) PinMessage(ctx context.Context, peerID int64, msgID int, notify bool) error {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("resolve peer: %w", err)
+	}
+
+	_, err = c.client.API().MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+		Peer:   peer,
+		ID:     msgID,
+		Silent: !notify,
+		Unpin:  false,
+	})
+	if err != nil {
+		return fmt.Errorf("pin message: %w", err)
+	}
+	return nil
+}
+
+// UnpinMessage unpins a specific message in a chat.
+func (c *MCUBClient) UnpinMessage(ctx context.Context, peerID int64, msgID int) error {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("resolve peer: %w", err)
+	}
+
+	_, err = c.client.API().MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
+		Peer:  peer,
+		ID:    msgID,
+		Unpin: true,
+	})
+	if err != nil {
+		return fmt.Errorf("unpin message: %w", err)
+	}
+	return nil
+}
+
+// UnpinAllMessages unpins all pinned messages in a chat.
+func (c *MCUBClient) UnpinAllMessages(ctx context.Context, peerID int64) error {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("resolve peer: %w", err)
+	}
+
+	_, err = c.client.API().MessagesUnpinAllMessages(ctx, &tg.MessagesUnpinAllMessagesRequest{
+		Peer: peer,
+	})
+	if err != nil {
+		return fmt.Errorf("unpin all messages: %w", err)
+	}
+	return nil
+}
+
+// SendAlbum sends multiple local files as a media album (grouped messages).
+func (c *MCUBClient) SendAlbum(ctx context.Context, peerID int64, files []string, caption string) ([]*tg.Message, error) {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve peer: %w", err)
+	}
+
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no files provided for album")
+	}
+
+	multiMedia := make([]tg.InputSingleMedia, 0, len(files))
+	for i, filePath := range files {
+		uploaded, err := c.uploadFile(ctx, UploadParams{Path: filePath})
+		if err != nil {
+			return nil, fmt.Errorf("upload file %d: %w", i, err)
+		}
+
+		media := &tg.InputMediaUploadedDocument{
+			File:     uploaded.InputFile,
+			MimeType: "application/octet-stream",
+			Attributes: []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeFilename{FileName: uploaded.FileName},
+			},
+		}
+
+		msg := ""
+		if i == 0 {
+			msg = caption
+		}
+
+		multiMedia = append(multiMedia, tg.InputSingleMedia{
+			Media:    media,
+			RandomID: rand.Int63(),
+			Message:  msg,
+		})
+	}
+
+	result, err := c.client.API().MessagesSendMultiMedia(ctx, &tg.MessagesSendMultiMediaRequest{
+		Peer:       peer,
+		MultiMedia: multiMedia,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("send album: %w", err)
+	}
+
+	var msgs []*tg.Message
+	switch u := result.(type) {
+	case *tg.Updates:
+		for _, upd := range u.Updates {
+			switch v := upd.(type) {
+			case *tg.UpdateNewMessage:
+				if m, ok := v.Message.(*tg.Message); ok {
+					msgs = append(msgs, m)
+				}
+			case *tg.UpdateNewChannelMessage:
+				if m, ok := v.Message.(*tg.Message); ok {
+					msgs = append(msgs, m)
+				}
+			}
+		}
+	}
+	return msgs, nil
+}
+
+// ReadHistory marks all messages up to maxID as read in the given chat.
+// Pass maxID = 0 to mark all messages as read.
+func (c *MCUBClient) ReadHistory(ctx context.Context, peerID int64, maxID int) error {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("resolve peer: %w", err)
+	}
+
+	_, err = c.client.API().MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{
+		Peer:  peer,
+		MaxID: maxID,
+	})
+	if err != nil {
+		return fmt.Errorf("read history: %w", err)
+	}
+	return nil
+}
+
 // --- helpers -----------------------------------------------------------------
 
 // resolvePeer converts a numeric peer ID to a tg.InputPeerClass.

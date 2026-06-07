@@ -279,6 +279,13 @@ func (c *MCUBClient) dispatch(ctx context.Context, u tg.UpdateClass) error {
 	if ev, ok := mcubevents.JoinRequestFromUpdate(ctx, u); ok {
 		return c.dispatcher.Dispatch(ctx, ev)
 	}
+	if ev, ok := mcubevents.CallbackQueryFromUpdate(ctx, u); ok {
+		ev.Answerer = c.api
+		return c.dispatcher.Dispatch(ctx, ev)
+	}
+	if ev, ok := mcubevents.InlineQueryFromUpdate(ctx, u); ok {
+		return c.dispatcher.Dispatch(ctx, ev)
+	}
 	return nil
 }
 
