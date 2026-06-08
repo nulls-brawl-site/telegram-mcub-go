@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -84,6 +85,27 @@ func (e *NewMessage) Text() string {
 // RawText returns the plain message text (same as Text; no markup parsing).
 func (e *NewMessage) RawText() string {
 	return e.Text()
+}
+
+// Args returns the text after the first word (command arguments).
+// Returns an empty string when there are no arguments.
+func (e *NewMessage) Args() string {
+	text := e.Text()
+	parts := strings.SplitN(text, " ", 2)
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
+}
+
+// ArgsList returns the command arguments split into individual tokens.
+// Returns nil when there are no arguments.
+func (e *NewMessage) ArgsList() []string {
+	args := e.Args()
+	if args == "" {
+		return nil
+	}
+	return strings.Fields(args)
 }
 
 // File returns an MCUBFile wrapping the media in this message, or nil.

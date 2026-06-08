@@ -239,6 +239,10 @@ func (d *Dispatcher) HandleUpdate(ctx context.Context, u tg.UpdateClass) error {
 	if ev, ok := InlineQueryFromUpdate(ctx, u); ok {
 		return d.Dispatch(ctx, ev)
 	}
+	// 7b. BotInlineSend
+	if ev, ok := BotInlineSendFromUpdate(ctx, u); ok {
+		return d.Dispatch(ctx, ev)
+	}
 	// 8. JoinRequest
 	if ev, ok := JoinRequestFromUpdate(ctx, u); ok {
 		return d.Dispatch(ctx, ev)
