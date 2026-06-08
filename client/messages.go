@@ -146,7 +146,7 @@ func (c *MCUBClient) DeleteMessage(ctx context.Context, params DeleteMessagePara
 
 // GetMessages fetches messages by their IDs from a given peer.
 func (c *MCUBClient) GetMessages(ctx context.Context, peerID int64, msgIDs []int) ([]*tg.Message, error) {
-	_, err := c.resolvePeer(ctx, peerID)
+	peer, err := c.resolvePeer(ctx, peerID)
 	if err != nil {
 		return nil, err
 	}
@@ -156,12 +156,50 @@ func (c *MCUBClient) GetMessages(ctx context.Context, peerID int64, msgIDs []int
 		ids = append(ids, &tg.InputMessageID{ID: id})
 	}
 
-	result, err := c.client.API().MessagesGetMessages(ctx, ids)
-	if err != nil {
-		return nil, fmt.Errorf("get messages: %w", err)
+	// Channels/supergroups: use ChannelsGetMessages
+	if peerID < -999999999 {
+		if ch, ok := peer.(*tg.InputPeerChannel); ok {
+			result, err := c.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+				Channel: &tg.InputChannel{ChannelID: ch.ChannelID, AccessHash: ch.AccessHash},
+				ID:      ids,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("get channel messages: %w", err)
+			}
+			return extractMessages(result), nil
+		}
 	}
 
-	return extractMessages(result), nil
+	// Basic groups and private chats: try MessagesGetMessages first.
+	// If it returns nothing (group messages have local IDs), fall back to
+	// GetHistory with offsetID so we fetch by peer + message ID.
+	result, err := c.client.API().MessagesGetMessages(ctx, ids)
+	if err == nil {
+		msgs := extractMessages(result)
+		if len(msgs) > 0 {
+			return msgs, nil
+		}
+	}
+
+	// Fallback: use GetHistory with offsetID for each requested message.
+	var out []*tg.Message
+	for _, id := range msgIDs {
+		hist, herr := c.client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:      peer,
+			OffsetID:  id + 1,
+			AddOffset: -1,
+			Limit:     1,
+		})
+		if herr != nil {
+			continue
+		}
+		for _, m := range extractMessages(hist) {
+			if m.ID == id {
+				out = append(out, m)
+			}
+		}
+	}
+	return out, nil
 }
 
 // ForwardMessage forwards a message from one chat to another.
