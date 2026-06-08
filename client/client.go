@@ -848,3 +848,9 @@ func (c *MCUBClient) GetDeviceModel() string {
 func (c *MCUBClient) GetSystemVersion() string {
 	return c.options.SystemVersion
 }
+
+// PeerAccessHash returns the cached access hash for the given packed peer ID.
+// Returns 0 if not cached yet.
+func (c *MCUBClient) PeerAccessHash(peerID int64) int64 {
+	return c.accessHashForPeer(peerID)
+}
