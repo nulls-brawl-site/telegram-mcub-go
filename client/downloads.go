@@ -386,19 +386,29 @@ func (c *MCUBClient) DownloadMedia(ctx context.Context, params DownloadMediaPara
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
 
-	// Fetch the target message.
-	histResult, err := c.client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-		Peer:     peer,
-		OffsetID: params.MessageID + 1,
-		Limit:    1,
-		MaxID:    params.MessageID,
-	})
+	// Fetch the target message using the peer-aware GetMessages helper
+	// which handles supergroups (ChannelsGetMessages) and basic groups (history fallback).
+	msgs, err := c.GetMessages(ctx, params.ChatID, []int{params.MessageID})
 	if err != nil {
 		return nil, fmt.Errorf("get message: %w", err)
 	}
-
-	msgs := extractMessages(histResult)
-	if len(msgs) == 0 || msgs[0].ID != params.MessageID {
+	if len(msgs) == 0 || msgs[0] == nil {
+		// Last resort: GetHistory with offset
+		histResult, herr := c.client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:      peer,
+			OffsetID:  params.MessageID + 1,
+			AddOffset: -1,
+			Limit:     1,
+		})
+		if herr == nil {
+			for _, m := range extractMessages(histResult) {
+				if m.ID == params.MessageID {
+					msgs = []*tg.Message{m}
+				}
+			}
+		}
+	}
+	if len(msgs) == 0 || msgs[0] == nil {
 		return nil, fmt.Errorf("message %d not found in chat %d", params.MessageID, params.ChatID)
 	}
 
