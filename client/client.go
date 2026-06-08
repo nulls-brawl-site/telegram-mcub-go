@@ -78,6 +78,11 @@ type MCUBClient struct {
 
 	// proxy holds the active proxy configuration (may be nil).
 	proxy *ProxyConfig
+
+	// peerCache stores access hashes extracted from received updates.
+	// key: packed peer ID (int64), value: access hash (int64)
+	peerCache   map[int64]int64
+	peerCacheMu sync.RWMutex
 }
 
 // Options configures the MCUBClient.
@@ -221,6 +226,7 @@ func New(opts Options) (*MCUBClient, error) {
 		protectionMode: opts.ProtectionMode,
 		options:        opts,
 		proxy:          opts.Proxy,
+		peerCache:      make(map[int64]int64),
 	}
 
 	// Determine protection policy.
@@ -273,17 +279,13 @@ func New(opts Options) (*MCUBClient, error) {
 		}
 	}
 
-	// Wire our HandleUpdates into gotd so incoming messages/events reach the dispatcher.
-	c.client = telegram.NewClient(opts.AppID, opts.AppHash, tdOpts)
-	c.api = c.client.API()
+	// Wire UpdateHandler BEFORE creating the client.
+	// Without this, gotd sets NoUpdates=true and never delivers messages.
+	tdOpts.UpdateHandler = telegram.UpdateHandlerFunc(func(ctx context.Context, upd tg.UpdatesClass) error {
+		return c.HandleUpdates(ctx, upd)
+	})
 
-	// Register the update handler AFTER client creation (uses the client reference).
-	c.client = telegram.NewClient(opts.AppID, opts.AppHash, func() telegram.Options {
-		tdOpts.UpdateHandler = telegram.UpdateHandlerFunc(func(ctx context.Context, upd tg.UpdatesClass) error {
-			return c.HandleUpdates(ctx, upd)
-		})
-		return tdOpts
-	}())
+	c.client = telegram.NewClient(opts.AppID, opts.AppHash, tdOpts)
 	c.api = c.client.API()
 
 	return c, nil
@@ -455,17 +457,49 @@ func (c *MCUBClient) dispatch(ctx context.Context, u tg.UpdateClass) error {
 	return nil
 }
 
+// cacheEntities extracts and stores access hashes from Users/Chats in Updates.
+func (c *MCUBClient) cacheEntities(users []tg.UserClass, chats []tg.ChatClass) {
+	c.peerCacheMu.Lock()
+	defer c.peerCacheMu.Unlock()
+	for _, u := range users {
+		if usr, ok := u.(*tg.User); ok && usr.AccessHash != 0 {
+			c.peerCache[int64(usr.ID)] = usr.AccessHash
+		}
+	}
+	for _, ch := range chats {
+		switch v := ch.(type) {
+		case *tg.Channel:
+			if v.AccessHash != 0 {
+				// Store with packed peer ID so resolvePeer can find it
+				packedID := -int64(v.ID) - 1000000000000
+				c.peerCache[packedID] = v.AccessHash
+			}
+		case *tg.Chat:
+			// Basic groups don't need access hash
+		}
+	}
+}
+
+// accessHashForPeer returns a cached access hash for the given packed peer ID.
+func (c *MCUBClient) accessHashForPeer(peerID int64) int64 {
+	c.peerCacheMu.RLock()
+	defer c.peerCacheMu.RUnlock()
+	return c.peerCache[peerID]
+}
+
 // HandleUpdates processes a batch of raw Telegram updates.
 // Wire this to the gotd UpdateHandlerFunc to receive events via the MCUBClient.
 func (c *MCUBClient) HandleUpdates(ctx context.Context, updates tg.UpdatesClass) error {
 	switch u := updates.(type) {
 	case *tg.Updates:
+		c.cacheEntities(u.Users, u.Chats)
 		for _, upd := range u.Updates {
 			if err := c.dispatch(ctx, upd); err != nil {
 				return err
 			}
 		}
 	case *tg.UpdatesCombined:
+		c.cacheEntities(u.Users, u.Chats)
 		for _, upd := range u.Updates {
 			if err := c.dispatch(ctx, upd); err != nil {
 				return err

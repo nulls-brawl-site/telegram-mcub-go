@@ -395,14 +395,16 @@ func (c *MCUBClient) resolvePeer(ctx context.Context, peerID int64) (tg.InputPee
 	if peerID == 0 {
 		return &tg.InputPeerSelf{}, nil
 	}
-	// Positive → user
+	// Positive → user; look up cached access hash
 	if peerID > 0 {
-		return &tg.InputPeerUser{UserID: peerID, AccessHash: 0}, nil
+		hash := c.accessHashForPeer(peerID)
+		return &tg.InputPeerUser{UserID: peerID, AccessHash: hash}, nil
 	}
-	// Packed channel/supergroup peer ID: -(channel_id + 1_000_000_000_000)
+	// Packed channel/supergroup: -(channel_id + 1_000_000_000_000)
 	if peerID < -999999999 {
 		chanID := channelIDFromPeerID(peerID)
-		return &tg.InputPeerChannel{ChannelID: chanID, AccessHash: 0}, nil
+		hash := c.accessHashForPeer(peerID)
+		return &tg.InputPeerChannel{ChannelID: chanID, AccessHash: hash}, nil
 	}
 	// Basic group
 	return &tg.InputPeerChat{ChatID: -peerID}, nil
