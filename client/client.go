@@ -273,7 +273,17 @@ func New(opts Options) (*MCUBClient, error) {
 		}
 	}
 
+	// Wire our HandleUpdates into gotd so incoming messages/events reach the dispatcher.
 	c.client = telegram.NewClient(opts.AppID, opts.AppHash, tdOpts)
+	c.api = c.client.API()
+
+	// Register the update handler AFTER client creation (uses the client reference).
+	c.client = telegram.NewClient(opts.AppID, opts.AppHash, func() telegram.Options {
+		tdOpts.UpdateHandler = telegram.UpdateHandlerFunc(func(ctx context.Context, upd tg.UpdatesClass) error {
+			return c.HandleUpdates(ctx, upd)
+		})
+		return tdOpts
+	}())
 	c.api = c.client.API()
 
 	return c, nil
