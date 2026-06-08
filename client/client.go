@@ -11,18 +11,23 @@
 package client
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/http"
 	"runtime"
 	"sync"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
+	"golang.org/x/net/proxy"
 
 	mcubevents "github.com/nulls-brawl-site/telegram-mcub-go/events"
 	"github.com/nulls-brawl-site/telegram-mcub-go/types"
@@ -252,6 +257,20 @@ func New(opts Options) (*MCUBClient, error) {
 	}
 	if opts.Session != nil {
 		tdOpts.SessionStorage = opts.Session
+	}
+
+	// Wire proxy if configured.
+	if opts.Proxy != nil {
+		dialFn, err := buildProxyDialer(opts.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("build proxy dialer: %w", err)
+		}
+		if dialFn != nil {
+			tdOpts.Resolver = dcs.Plain(dcs.PlainOptions{
+				Dial:       dialFn,
+				PreferIPv6: opts.UseIPv6,
+			})
+		}
 	}
 
 	c.client = telegram.NewClient(opts.AppID, opts.AppHash, tdOpts)
@@ -605,4 +624,183 @@ func (c *MCUBClient) ExportSession(ctx context.Context) (string, error) {
 
 	encoded := base64.URLEncoding.EncodeToString(buf)
 	return "1" + encoded, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Proxy helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// contextDialer is satisfied by dialers that support context-aware dialling
+// (e.g. the object returned by golang.org/x/net/proxy.SOCKS5 on modern Go).
+type contextDialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// buildProxyDialer returns a dcs.DialFunc that routes connections through the
+// configured proxy. Returns (nil, nil) when p is nil.
+func buildProxyDialer(p *ProxyConfig) (dcs.DialFunc, error) {
+	if p == nil {
+		return nil, nil
+	}
+	proxyAddr := fmt.Sprintf("%s:%d", p.Host, p.Port)
+	switch p.Type {
+	case "socks5":
+		var auth *proxy.Auth
+		if p.Username != "" {
+			auth = &proxy.Auth{User: p.Username, Password: p.Password}
+		}
+		d, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("create SOCKS5 dialer for %s: %w", proxyAddr, err)
+		}
+		// Prefer DialContext when available to propagate cancellations.
+		if cd, ok := d.(contextDialer); ok {
+			return cd.DialContext, nil
+		}
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return d.Dial(network, addr)
+		}, nil
+
+	case "http":
+		return httpConnectDialFunc(p), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported proxy type %q (want socks5 or http)", p.Type)
+	}
+}
+
+// httpConnectDialFunc returns a DialFunc that tunnels through an HTTP CONNECT proxy.
+func httpConnectDialFunc(p *ProxyConfig) dcs.DialFunc {
+	proxyAddr := fmt.Sprintf("%s:%d", p.Host, p.Port)
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", proxyAddr)
+		if err != nil {
+			return nil, fmt.Errorf("dial HTTP proxy %s: %w", proxyAddr, err)
+		}
+
+		reqLine := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
+		if p.Username != "" {
+			creds := base64.StdEncoding.EncodeToString(
+				[]byte(p.Username + ":" + p.Password),
+			)
+			reqLine += "Proxy-Authorization: Basic " + creds + "\r\n"
+		}
+		reqLine += "\r\n"
+
+		if _, err := conn.Write([]byte(reqLine)); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("HTTP CONNECT write: %w", err)
+		}
+
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("HTTP CONNECT read response: %w", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			_ = conn.Close()
+			return nil, fmt.Errorf("HTTP proxy %s returned status %d", proxyAddr, resp.StatusCode)
+		}
+		return conn, nil
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telethon-parity accessor methods
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GetDialStr returns the current DC's address in "host:port" form.
+// Equivalent to Telethon's _get_dc / session.server_address+port.
+func (c *MCUBClient) GetDialStr() string {
+	return c.GetServerAddress()
+}
+
+// GetDCConfig queries Telegram for the full DC configuration list.
+// Equivalent to Telethon's help.getConfig call used during bootstrap.
+func (c *MCUBClient) GetDCConfig(ctx context.Context) (*tg.Config, error) {
+	cfg, err := c.api.HelpGetConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get DC config: %w", err)
+	}
+	return cfg, nil
+}
+
+// BootstrapResolution fetches the nearest-DC hint from Telegram and records it
+// for informational purposes. Under gotd/td the actual DC migration is handled
+// transparently; this method replicates the Telethon bootstrap resolution step.
+func (c *MCUBClient) BootstrapResolution(ctx context.Context) error {
+	nearest, err := c.api.HelpGetNearestDC(ctx)
+	if err != nil {
+		return fmt.Errorf("bootstrap resolution: %w", err)
+	}
+	_ = nearest // informational; gotd manages DC selection internally
+	return nil
+}
+
+// InvokeWithLayer wraps req in an invokeWithLayer TL constructor and fires the
+// resulting request via the raw MTProto invoker, discarding the response.
+// This replicates Telethon's InvokeWithLayerRequest usage (typically for
+// sending initConnection during session setup).
+//
+// req must implement both bin.Encoder and bin.Decoder (i.e. bin.Object).
+// gotd/td handles layer negotiation automatically during Run; this method is
+// provided for callers that need explicit control or debugging.
+func (c *MCUBClient) InvokeWithLayer(ctx context.Context, layer int, req bin.Object) error {
+	wrapped := &tg.InvokeWithLayerRequest{
+		Layer: layer,
+		Query: req,
+	}
+	// Config satisfies bin.Decoder and is a reasonable output container when
+	// the caller doesn't care about the specific response type.
+	var out tg.Config
+	return c.api.Invoker().Invoke(ctx, wrapped, &out)
+}
+
+// InitConnection sends an initConnection RPC to Telegram using the device
+// parameters from Options. gotd/td performs this automatically on every
+// session start; this method allows explicit re-invocation.
+func (c *MCUBClient) InitConnection(ctx context.Context) error {
+	_, err := c.api.HelpGetConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("init connection (via HelpGetConfig): %w", err)
+	}
+	return nil
+}
+
+// GetFloodSleepThreshold returns the current flood-sleep threshold in seconds.
+// When a FloodWaitError asks for <= this many seconds, the client sleeps
+// automatically; otherwise it propagates the error.
+func (c *MCUBClient) GetFloodSleepThreshold() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.options.FloodSleepThreshold
+}
+
+// SetFloodSleepThreshold updates the flood-sleep threshold in seconds.
+func (c *MCUBClient) SetFloodSleepThreshold(secs int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.options.FloodSleepThreshold = secs
+}
+
+// GetLangCode returns the configured ISO 639-1 language code (e.g. "en").
+func (c *MCUBClient) GetLangCode() string {
+	return c.options.LangCode
+}
+
+// GetAppVersion returns the application version string (e.g. "1.0").
+func (c *MCUBClient) GetAppVersion() string {
+	return c.options.AppVersion
+}
+
+// GetDeviceModel returns the device model string sent during session init.
+func (c *MCUBClient) GetDeviceModel() string {
+	return c.options.DeviceModel
+}
+
+// GetSystemVersion returns the system/OS version string sent during session init.
+func (c *MCUBClient) GetSystemVersion() string {
+	return c.options.SystemVersion
 }

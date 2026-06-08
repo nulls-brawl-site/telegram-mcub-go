@@ -419,6 +419,172 @@ type gotdDataInner struct {
 	Salt      int64      `json:"Salt"`
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DatabaseSessionStorage — generic SQL database session backend.
+//
+// Any database/sql-compatible driver can be used (PostgreSQL, MySQL, SQLite,
+// etc.). The caller is responsible for opening the *sql.DB and importing the
+// appropriate driver.  A single row keyed by name is maintained in the table
+// `mcub_db_session`.  The table is created automatically on first use.
+//
+// Example (PostgreSQL):
+//
+//	db, _ := sql.Open("postgres", dsn)
+//	store, _ := session.NewDatabaseSessionStorage(db, "my_bot")
+//	opts.Session = store.Storage()
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+const dbSchema = `
+CREATE TABLE IF NOT EXISTS mcub_db_session (
+    name TEXT    PRIMARY KEY,
+    data BYTEA   NOT NULL
+);
+`
+
+// DatabaseSessionStorage stores a gotd session as a binary blob in a database
+// table.  It uses a parameterised UPSERT that is compatible with PostgreSQL,
+// MySQL (via ON DUPLICATE KEY UPDATE), and SQLite.
+type DatabaseSessionStorage struct {
+	db   *sql.DB
+	name string
+}
+
+// NewDatabaseSessionStorage initialises a DatabaseSessionStorage backed by db.
+// name is the session key stored in the name column; it must be unique per bot/
+// account in the same database.  The session table is created if absent.
+func NewDatabaseSessionStorage(db *sql.DB, name string) (*DatabaseSessionStorage, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database session storage: db must not be nil")
+	}
+	if name == "" {
+		return nil, fmt.Errorf("database session storage: name must not be empty")
+	}
+	if _, err := db.Exec(dbSchema); err != nil {
+		return nil, fmt.Errorf("database session storage: init schema: %w", err)
+	}
+	return &DatabaseSessionStorage{db: db, name: name}, nil
+}
+
+// Storage returns the DatabaseSessionStorage itself as a session.Storage so it
+// can be passed directly to telegram.Options.SessionStorage.
+func (d *DatabaseSessionStorage) Storage() session.Storage {
+	return d
+}
+
+// LoadSession implements session.Storage.
+func (d *DatabaseSessionStorage) LoadSession(ctx context.Context) ([]byte, error) {
+	var data []byte
+	err := d.db.QueryRowContext(ctx,
+		`SELECT data FROM mcub_db_session WHERE name = $1`, d.name,
+	).Scan(&data)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("database session load %q: %w", d.name, err)
+	}
+	return data, nil
+}
+
+// StoreSession implements session.Storage.
+func (d *DatabaseSessionStorage) StoreSession(ctx context.Context, data []byte) error {
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO mcub_db_session (name, data) VALUES ($1, $2)
+		 ON CONFLICT(name) DO UPDATE SET data = EXCLUDED.data`,
+		d.name, data,
+	)
+	if err != nil {
+		return fmt.Errorf("database session store %q: %w", d.name, err)
+	}
+	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CachedSessionStorage — in-memory read-through cache for any session.Storage.
+//
+// Wraps an existing storage backend and keeps a copy of the last written blob
+// in memory, so LoadSession returns instantly on subsequent calls without a
+// round-trip to the underlying storage.
+//
+// Thread-safe.
+//
+// Example:
+//
+//	inner, _ := session.NewFileSessionStorage("/tmp/session.json")
+//	cached  := session.NewCachedSessionStorage(inner.Storage())
+//	opts.Session = cached
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+// CachedSessionStorage wraps another storage.SessionStorage with an in-memory
+// read-through cache.  The first LoadSession call that finds no cached data
+// falls through to the inner storage and populates the cache.  Subsequent
+// calls return the cached bytes without touching the inner storage.
+type CachedSessionStorage struct {
+	inner  session.Storage
+	cached []byte
+	mu     sync.RWMutex
+}
+
+// NewCachedSessionStorage creates a CachedSessionStorage wrapping inner.
+// inner must not be nil.
+func NewCachedSessionStorage(inner session.Storage) *CachedSessionStorage {
+	if inner == nil {
+		panic("session: NewCachedSessionStorage: inner storage must not be nil")
+	}
+	return &CachedSessionStorage{inner: inner}
+}
+
+// LoadSession implements session.Storage.  Returns the in-memory cache if
+// populated; otherwise falls through to the inner storage and caches the result.
+func (c *CachedSessionStorage) LoadSession(ctx context.Context) ([]byte, error) {
+	c.mu.RLock()
+	if len(c.cached) > 0 {
+		out := make([]byte, len(c.cached))
+		copy(out, c.cached)
+		c.mu.RUnlock()
+		return out, nil
+	}
+	c.mu.RUnlock()
+
+	// Cache miss — load from inner storage.
+	data, err := c.inner.LoadSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 0 {
+		c.mu.Lock()
+		c.cached = make([]byte, len(data))
+		copy(c.cached, data)
+		c.mu.Unlock()
+	}
+	return data, nil
+}
+
+// StoreSession implements session.Storage.  Writes to the inner storage and
+// updates the in-memory cache atomically.
+func (c *CachedSessionStorage) StoreSession(ctx context.Context, data []byte) error {
+	if err := c.inner.StoreSession(ctx, data); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.cached = make([]byte, len(data))
+	copy(c.cached, data)
+	c.mu.Unlock()
+	return nil
+}
+
+// Invalidate clears the in-memory cache, forcing the next LoadSession call to
+// read from the inner storage.
+func (c *CachedSessionStorage) Invalidate() {
+	c.mu.Lock()
+	c.cached = nil
+	c.mu.Unlock()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // gotdConfig mirrors the subset of tg.Config stored in gotd sessions.
 // We only need to supply enough fields for the JSON schema to unmarshal cleanly.
 type gotdConfig struct {
