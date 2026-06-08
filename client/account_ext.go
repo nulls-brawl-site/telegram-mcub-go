@@ -196,8 +196,8 @@ func (c *MCUBClient) GetDialogFilters(ctx context.Context) ([]tg.DialogFilterCla
 	if err != nil {
 		return nil, fmt.Errorf("get dialog filters: %w", err)
 	}
-	out := make([]tg.DialogFilterClass, 0, len(result))
-	for _, f := range result {
+	out := make([]tg.DialogFilterClass, 0, len(result.Filters))
+	for _, f := range result.Filters {
 		out = append(out, f)
 	}
 	return out, nil

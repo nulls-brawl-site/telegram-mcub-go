@@ -326,7 +326,7 @@ func (c *MCUBClient) GetMe(ctx context.Context) (*tg.User, error) {
 
 // GetEntity resolves a username to a Telegram peer.
 func (c *MCUBClient) GetEntity(ctx context.Context, username string) (tg.UserClass, error) {
-	result, err := c.api.ContactsResolveUsername(ctx, username)
+	result, err := c.api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
 	if err != nil {
 		return nil, fmt.Errorf("resolve username %q: %w", username, err)
 	}

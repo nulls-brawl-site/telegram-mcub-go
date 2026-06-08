@@ -941,17 +941,17 @@ func (c *MCUBClient) SendPoll(ctx context.Context, peerID int64, question string
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
 
-	pollAnswers := make([]tg.PollAnswer, len(answers))
+	pollAnswers := make([]tg.PollAnswerClass, len(answers))
 	for i, a := range answers {
-		pollAnswers[i] = tg.PollAnswer{
-			Text:   a,
+		pollAnswers[i] = &tg.PollAnswer{
+			Text:   tg.TextWithEntities{Text: a},
 			Option: []byte{byte(i)},
 		}
 	}
 
 	media := &tg.InputMediaPoll{
 		Poll: tg.Poll{
-			Question: question,
+			Question: tg.TextWithEntities{Text: question},
 			Answers:  pollAnswers,
 			Quiz:     quiz,
 		},
@@ -1157,7 +1157,7 @@ func (c *MCUBClient) GetMessageByLink(ctx context.Context, link string) (*tg.Mes
 	}
 
 	// Resolve the username to a peer.
-	resolved, err := c.api.ContactsResolveUsername(ctx, username)
+	resolved, err := c.api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
 	if err != nil {
 		return nil, fmt.Errorf("get message by link %q: resolve username: %w", link, err)
 	}

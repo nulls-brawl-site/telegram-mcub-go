@@ -53,8 +53,8 @@ type CreateTopicParams struct {
 
 // CreateTopic creates a new forum topic in a supergroup.
 func (c *MCUBClient) CreateTopic(ctx context.Context, params CreateTopicParams) (*Topic, error) {
-	req := &tg.ChannelsCreateForumTopicRequest{
-		Channel:    &tg.InputChannel{ChannelID: params.ChannelID},
+	req := &tg.MessagesCreateForumTopicRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: params.ChannelID},
 		Title:      params.Title,
 		RandomID:   rand.Int63(),
 	}
@@ -67,7 +67,7 @@ func (c *MCUBClient) CreateTopic(ctx context.Context, params CreateTopicParams) 
 		req.Flags.Set(3)
 	}
 
-	result, err := c.client.API().ChannelsCreateForumTopic(ctx, req)
+	result, err := c.client.API().MessagesCreateForumTopic(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("create topic: %w", err)
 	}
@@ -124,8 +124,8 @@ func (c *MCUBClient) GetTopics(ctx context.Context, params GetTopicsParams) ([]*
 		limit = 100
 	}
 
-	result, err := c.client.API().ChannelsGetForumTopics(ctx, &tg.ChannelsGetForumTopicsRequest{
-		Channel:    &tg.InputChannel{ChannelID: params.ChannelID},
+	result, err := c.client.API().MessagesGetForumTopics(ctx, &tg.MessagesGetForumTopicsRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: params.ChannelID},
 		OffsetDate: params.OffsetDate,
 		OffsetID:   params.OffsetID,
 		OffsetTopic: 0,
@@ -140,8 +140,8 @@ func (c *MCUBClient) GetTopics(ctx context.Context, params GetTopicsParams) ([]*
 
 // getTopicsByIDs fetches specific topics by ID.
 func (c *MCUBClient) getTopicsByIDs(ctx context.Context, channelID int64, ids []int) ([]*Topic, error) {
-	result, err := c.client.API().ChannelsGetForumTopicsByID(ctx, &tg.ChannelsGetForumTopicsByIDRequest{
-		Channel: &tg.InputChannel{ChannelID: channelID},
+	result, err := c.client.API().MessagesGetForumTopicsByID(ctx, &tg.MessagesGetForumTopicsByIDRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: channelID},
 		Topics:  ids,
 	})
 	if err != nil {
@@ -163,8 +163,8 @@ func (c *MCUBClient) IterTopics(ctx context.Context, channelID int64, batchSize 
 	)
 
 	for {
-		result, err := c.client.API().ChannelsGetForumTopics(ctx, &tg.ChannelsGetForumTopicsRequest{
-			Channel:     &tg.InputChannel{ChannelID: channelID},
+		result, err := c.client.API().MessagesGetForumTopics(ctx, &tg.MessagesGetForumTopicsRequest{
+			Peer: &tg.InputPeerChannel{ChannelID: channelID},
 			OffsetDate:  offsetDate,
 			OffsetID:    offsetID,
 			OffsetTopic: 0,
@@ -306,12 +306,12 @@ func (c *MCUBClient) CloseTopic(ctx context.Context, channelID int64, topicID in
 	if err != nil {
 		return fmt.Errorf("resolve channel: %w", err)
 	}
-	req := &tg.ChannelsEditForumTopicRequest{
-		Channel: channel,
+	req := &tg.MessagesEditForumTopicRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
 		TopicID: topicID,
 	}
 	req.SetClosed(true)
-	_, err = c.client.API().ChannelsEditForumTopic(ctx, req)
+	_, err = c.client.API().MessagesEditForumTopic(ctx, req)
 	if err != nil {
 		return fmt.Errorf("close topic %d: %w", topicID, err)
 	}
@@ -324,12 +324,12 @@ func (c *MCUBClient) ReopenTopic(ctx context.Context, channelID int64, topicID i
 	if err != nil {
 		return fmt.Errorf("resolve channel: %w", err)
 	}
-	req := &tg.ChannelsEditForumTopicRequest{
-		Channel: channel,
+	req := &tg.MessagesEditForumTopicRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
 		TopicID: topicID,
 	}
 	req.SetClosed(false)
-	_, err = c.client.API().ChannelsEditForumTopic(ctx, req)
+	_, err = c.client.API().MessagesEditForumTopic(ctx, req)
 	if err != nil {
 		return fmt.Errorf("reopen topic %d: %w", topicID, err)
 	}
@@ -343,8 +343,8 @@ func (c *MCUBClient) DeleteTopicHistory(ctx context.Context, channelID int64, to
 	if err != nil {
 		return nil, fmt.Errorf("resolve channel: %w", err)
 	}
-	result, err := c.client.API().ChannelsDeleteTopicHistory(ctx, &tg.ChannelsDeleteTopicHistoryRequest{
-		Channel:  channel,
+	result, err := c.client.API().MessagesDeleteTopicHistory(ctx, &tg.MessagesDeleteTopicHistoryRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
 		TopMsgID: topicID,
 	})
 	if err != nil {
@@ -359,8 +359,8 @@ func (c *MCUBClient) PinTopic(ctx context.Context, channelID int64, topicID int,
 	if err != nil {
 		return fmt.Errorf("resolve channel: %w", err)
 	}
-	_, err = c.client.API().ChannelsUpdatePinnedForumTopic(ctx, &tg.ChannelsUpdatePinnedForumTopicRequest{
-		Channel: channel,
+	_, err = c.client.API().MessagesUpdatePinnedForumTopic(ctx, &tg.MessagesUpdatePinnedForumTopicRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
 		TopicID: topicID,
 		Pinned:  pinned,
 	})
@@ -378,14 +378,14 @@ func (c *MCUBClient) ReorderTopics(ctx context.Context, channelID int64, topicID
 	if err != nil {
 		return fmt.Errorf("resolve channel: %w", err)
 	}
-	req := &tg.ChannelsReorderPinnedForumTopicsRequest{
-		Channel: channel,
+	req := &tg.MessagesReorderPinnedForumTopicsRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
 		Order:   topicIDs,
 	}
 	if force {
 		req.Force = true
 	}
-	_, err = c.client.API().ChannelsReorderPinnedForumTopics(ctx, req)
+	_, err = c.client.API().MessagesReorderPinnedForumTopics(ctx, req)
 	if err != nil {
 		return fmt.Errorf("reorder topics: %w", err)
 	}
@@ -412,12 +412,12 @@ func (c *MCUBClient) SetTopicIcon(ctx context.Context, channelID int64, topicID 
 	if err != nil {
 		return fmt.Errorf("resolve channel: %w", err)
 	}
-	req := &tg.ChannelsEditForumTopicRequest{
-		Channel: channel,
+	req := &tg.MessagesEditForumTopicRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
 		TopicID: topicID,
 	}
 	req.SetIconEmojiID(emojiID)
-	_, err = c.client.API().ChannelsEditForumTopic(ctx, req)
+	_, err = c.client.API().MessagesEditForumTopic(ctx, req)
 	if err != nil {
 		return fmt.Errorf("set topic icon %d: %w", topicID, err)
 	}
@@ -430,12 +430,12 @@ func (c *MCUBClient) EditTopicTitle(ctx context.Context, channelID int64, topicI
 	if err != nil {
 		return fmt.Errorf("resolve channel: %w", err)
 	}
-	req := &tg.ChannelsEditForumTopicRequest{
-		Channel: channel,
+	req := &tg.MessagesEditForumTopicRequest{
+		Peer: &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
 		TopicID: topicID,
 	}
 	req.SetTitle(title)
-	_, err = c.client.API().ChannelsEditForumTopic(ctx, req)
+	_, err = c.client.API().MessagesEditForumTopic(ctx, req)
 	if err != nil {
 		return fmt.Errorf("edit topic title %d: %w", topicID, err)
 	}

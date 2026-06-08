@@ -192,7 +192,7 @@ func (c *MCUBClient) CreateGroup(ctx context.Context, title string, userIDs []in
 
 	// Extract the Chat from the updates.
 	var chat *tg.Chat
-	switch u := result.(type) {
+	switch u := result.Updates.(type) {
 	case *tg.Updates:
 		for _, ch := range u.Chats {
 			if c, ok := ch.(*tg.Chat); ok {

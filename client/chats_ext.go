@@ -52,7 +52,7 @@ func (c *MCUBClient) JoinChannel(ctx context.Context, channelIDOrLink string) (i
 
 	// Otherwise treat as a username.
 	username := strings.TrimPrefix(channelIDOrLink, "@")
-	result, err := c.api.ContactsResolveUsername(ctx, username)
+	result, err := c.api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
 	if err != nil {
 		return nil, fmt.Errorf("resolve username %q: %w", username, err)
 	}

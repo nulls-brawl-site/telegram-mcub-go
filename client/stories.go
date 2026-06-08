@@ -190,11 +190,11 @@ func (c *MCUBClient) CanSendStory(ctx context.Context, peerID int64) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("resolve peer: %w", err)
 	}
-	ok, err := c.client.API().StoriesCanSendStory(ctx, peer)
+	result, err := c.client.API().StoriesCanSendStory(ctx, peer)
 	if err != nil {
 		return false, fmt.Errorf("can send story: %w", err)
 	}
-	return ok, nil
+	return result.CountRemains > 0, nil
 }
 
 // peerStoriesToStories converts raw story items to []*Story, attaching peerID.

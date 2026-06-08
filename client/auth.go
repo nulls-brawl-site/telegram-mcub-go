@@ -406,12 +406,23 @@ func (c *MCUBClient) GetPassword(ctx context.Context) (*tg.AccountPassword, erro
 	return pwd, nil
 }
 
-// CheckPassword verifies the 2FA password and, on success, returns the
-// authorised user. Ported from Telethon's sign_in(password=...) path.
+// CheckPassword verifies a 2FA password using the MTProto SRP protocol and,
+// on success, returns the authorised user.
+//
+// Internally gotd/td fetches account.Password, computes the SRP answer via
+// the same algorithm as Telethon's password.py::compute_check(), and calls
+// auth.checkPassword — so the caller only needs to supply the plaintext password.
+//
+// Ported from Telethon's sign_in(password=...) path (telethon/client/auth.py).
 func (c *MCUBClient) CheckPassword(ctx context.Context, password string) (*tg.User, error) {
+	// gotd/td's Auth().Password() handles the full SRP flow:
+	//   1. AccountGetPassword to obtain salt1, salt2, g, p, srp_id, srp_B
+	//   2. Compute PH2(password, salt1, salt2) → x
+	//   3. Generate random a, derive A = g^a mod p and M1 proof
+	//   4. Call auth.checkPassword with InputCheckPasswordSRP{srp_id, A, M1}
 	result, err := c.client.Auth().Password(ctx, password)
 	if err != nil {
-		return nil, fmt.Errorf("check password: %w", err)
+		return nil, fmt.Errorf("check password (SRP): %w", err)
 	}
 	user, ok := result.User.(*tg.User)
 	if !ok {

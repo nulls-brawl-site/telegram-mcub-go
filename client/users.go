@@ -308,7 +308,7 @@ func (c *MCUBClient) ResolveUsername(ctx context.Context, username string) (inte
 	if len(username) > 0 && username[0] == '@' {
 		username = username[1:]
 	}
-	result, err := c.api.ContactsResolveUsername(ctx, username)
+	result, err := c.api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
 	if err != nil {
 		return nil, fmt.Errorf("resolve username @%s: %w", username, err)
 	}
@@ -379,7 +379,7 @@ func (c *MCUBClient) GetInputEntity(ctx context.Context, entity interface{}) (tg
 		if len(username) > 0 && username[0] == '@' {
 			username = username[1:]
 		}
-		result, err := c.api.ContactsResolveUsername(ctx, username)
+		result, err := c.api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
 		if err != nil {
 			return nil, fmt.Errorf("resolve username %q: %w", v, err)
 		}
