@@ -642,6 +642,101 @@ func (c *MCUBClient) GetDownloadURL(ctx context.Context, msgID int, chatID int64
 	return "", fmt.Errorf("cannot generate public URL for private chat peer %d", chatID)
 }
 
+// DownloadProfilePhotoToBytes downloads the profile photo for a user or chat and
+// returns the raw bytes. entityID follows the same conventions as DownloadProfilePhoto.
+func (c *MCUBClient) DownloadProfilePhotoToBytes(ctx context.Context, entityID int64) ([]byte, error) {
+	var location tg.InputFileLocationClass
+
+	if entityID > 0 {
+		result, err := c.client.API().PhotosGetUserPhotos(ctx, &tg.PhotosGetUserPhotosRequest{
+			UserID: &tg.InputUser{UserID: entityID},
+			Offset: 0,
+			MaxID:  0,
+			Limit:  1,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("get user photos: %w", err)
+		}
+
+		var photos []tg.PhotoClass
+		switch r := result.(type) {
+		case *tg.PhotosPhotos:
+			photos = r.Photos
+		case *tg.PhotosPhotosSlice:
+			photos = r.Photos
+		}
+		if len(photos) == 0 {
+			return nil, fmt.Errorf("user %d has no profile photo", entityID)
+		}
+		photo, ok := photos[0].(*tg.Photo)
+		if !ok {
+			return nil, fmt.Errorf("profile photo is empty")
+		}
+		thumbType, _ := pickPhotoThumb(photo.Sizes, -1)
+		location = &tg.InputPhotoFileLocation{
+			ID:            photo.ID,
+			AccessHash:    photo.AccessHash,
+			FileReference: photo.FileReference,
+			ThumbSize:     thumbType,
+		}
+	} else {
+		peer, err := c.resolvePeer(ctx, entityID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve peer: %w", err)
+		}
+		location = &tg.InputPeerPhotoFileLocation{
+			Peer:    peer,
+			PhotoID: 0,
+			Big:     true,
+		}
+	}
+
+	return downloadToMemory(ctx, c, location, -1, nil)
+}
+
+// GetDocumentInputLocation extracts the file location, size, and MIME type from a
+// message's media attachment. Supports documents and photos. Returns an error for
+// messages without downloadable media.
+func GetDocumentInputLocation(msg *tg.Message) (tg.InputFileLocationClass, int64, error) {
+	if msg.Media == nil {
+		return nil, 0, fmt.Errorf("message %d has no media", msg.ID)
+	}
+	switch m := msg.Media.(type) {
+	case *tg.MessageMediaDocument:
+		doc, ok := m.Document.(*tg.Document)
+		if !ok {
+			return nil, 0, fmt.Errorf("message %d: document is empty or unavailable", msg.ID)
+		}
+		return &tg.InputDocumentFileLocation{
+			ID:            doc.ID,
+			AccessHash:    doc.AccessHash,
+			FileReference: doc.FileReference,
+		}, doc.Size, nil
+
+	case *tg.MessageMediaPhoto:
+		photo, ok := m.Photo.(*tg.Photo)
+		if !ok {
+			return nil, 0, fmt.Errorf("message %d: photo is empty or unavailable", msg.ID)
+		}
+		sizes := photo.Sizes
+		if len(sizes) == 0 {
+			return nil, 0, fmt.Errorf("message %d: photo has no sizes", msg.ID)
+		}
+		largest := sizes[len(sizes)-1]
+		size := int64(0)
+		if s, ok := largest.(*tg.PhotoSize); ok {
+			size = int64(s.Size)
+		}
+		return &tg.InputPhotoFileLocation{
+			ID:            photo.ID,
+			AccessHash:    photo.AccessHash,
+			FileReference: photo.FileReference,
+			ThumbSize:     "y",
+		}, size, nil
+	}
+	return nil, 0, fmt.Errorf("message %d: unsupported media type %T", msg.ID, msg.Media)
+}
+
 // ResumableDownload supports resuming interrupted file downloads.
 // Populate ChatID, MsgID, and FilePath then call Start.
 type ResumableDownload struct {

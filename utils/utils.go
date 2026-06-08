@@ -422,11 +422,19 @@ func IsMegagroup(entity interface{}) bool {
 
 var (
 	usernameRE      = regexp.MustCompile(`@|(?:https?://)?(?:www\.)?(?:telegram\.(?:me|dog)|t\.me)/(@|\+|joinchat/)?`)
-	validUsernameRE = regexp.MustCompile(`(?i)^[a-z](?:(?!__)\w){1,30}[a-z\d]$`)
+	// RE2 does not support negative lookaheads, so we use a two-step check:
+	// 1. basic structure: starts with letter, 1-30 word chars, ends with letter/digit
+	// 2. does not contain "__"  (enforced in ValidUsername)
+	validUsernameRE = regexp.MustCompile(`(?i)^[a-z]\w{1,30}[a-z\d]$`)
 )
 
 // ValidUsername reports whether s is a valid Telegram username (without @).
+// Mirrors Telethon's VALID_USERNAME_RE but uses a two-step check because
+// Go's RE2 engine does not support negative lookaheads.
 func ValidUsername(username string) bool {
+	if strings.Contains(username, "__") {
+		return false
+	}
 	return validUsernameRE.MatchString(username)
 }
 

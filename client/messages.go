@@ -1197,6 +1197,87 @@ func (c *MCUBClient) GetMessageByLink(ctx context.Context, link string) (*tg.Mes
 	return msgs[0], nil
 }
 
+// GetReplyTo returns the message that msg is replying to, or nil if msg has no reply.
+func (c *MCUBClient) GetReplyTo(ctx context.Context, peerID int64, msg *tg.Message) (*tg.Message, error) {
+	if msg.ReplyTo == nil {
+		return nil, nil
+	}
+	rt, ok := msg.ReplyTo.(*tg.MessageReplyHeader)
+	if !ok {
+		return nil, nil
+	}
+	replyToID := rt.ReplyToMsgID
+	msgs, err := c.GetMessages(ctx, peerID, []int{replyToID})
+	if err != nil || len(msgs) == 0 {
+		return nil, err
+	}
+	return msgs[0], nil
+}
+
+// SendAnimation sends a GIF/animation file to the given peer.
+// filePath is the local path to the animation; caption is an optional HTML caption.
+func (c *MCUBClient) SendAnimation(ctx context.Context, peerID int64, filePath, caption string) (*tg.Message, error) {
+	return c.SendFileAdvanced(ctx, SendFileAdvancedParams{
+		PeerID:    peerID,
+		FilePath:  filePath,
+		Caption:   caption,
+		ParseMode: "html",
+	})
+}
+
+// GetMessageStats returns message statistics (views, forwards, reactions, etc.)
+// for a channel message. Only available for channel messages.
+func (c *MCUBClient) GetMessageStats(ctx context.Context, peerID int64, msgID int) (*tg.StatsMessageStats, error) {
+	ch, err := c.resolveInputChannel(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve channel: %w", err)
+	}
+	r, err := c.client.API().StatsGetMessageStats(ctx, &tg.StatsGetMessageStatsRequest{
+		Channel: ch,
+		MsgID:   msgID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get message stats: %w", err)
+	}
+	return r, nil
+}
+
+// ExportChatInviteLink creates a new permanent invite link for the given chat.
+func (c *MCUBClient) ExportChatInviteLink(ctx context.Context, chatID int64) (string, error) {
+	peer, err := c.resolvePeer(ctx, chatID)
+	if err != nil {
+		return "", fmt.Errorf("resolve peer: %w", err)
+	}
+	r, err := c.client.API().MessagesExportChatInvite(ctx, &tg.MessagesExportChatInviteRequest{
+		Peer: peer,
+	})
+	if err != nil {
+		return "", fmt.Errorf("export chat invite: %w", err)
+	}
+	if link, ok := r.(*tg.ChatInviteExported); ok {
+		return link.Link, nil
+	}
+	return "", nil
+}
+
+// GetMessagesViews increments (or retrieves) the view count for the given message IDs
+// in a channel or chat. Set increment=true to count the view.
+func (c *MCUBClient) GetMessagesViews(ctx context.Context, peerID int64, msgIDs []int, increment bool) error {
+	peer, err := c.resolvePeer(ctx, peerID)
+	if err != nil {
+		return fmt.Errorf("resolve peer: %w", err)
+	}
+	_, err = c.client.API().MessagesGetMessagesViews(ctx, &tg.MessagesGetMessagesViewsRequest{
+		Peer:      peer,
+		ID:        msgIDs,
+		Increment: increment,
+	})
+	if err != nil {
+		return fmt.Errorf("get messages views: %w", err)
+	}
+	return nil
+}
+
 // SendInlineResult sends an inline bot query result to a chat.
 // queryID is the query ID from a bot.getInlineQueryResults call.
 // resultID is the identifier of the chosen result.

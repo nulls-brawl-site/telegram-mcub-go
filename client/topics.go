@@ -72,11 +72,27 @@ func (c *MCUBClient) CreateTopic(ctx context.Context, params CreateTopicParams) 
 		return nil, fmt.Errorf("create topic: %w", err)
 	}
 
+	// The topic ID equals the message ID of the service message that created it.
+	// Extract it from the updates so callers get a fully populated Topic back.
 	msg := extractMessageFromUpdates(result)
-	_ = msg
-	// The topic ID is the message ID of the service message that created it.
-	// We return a stub; callers should use GetTopics to refresh.
-	return &Topic{Title: params.Title}, nil
+	topicID := 0
+	if msg != nil {
+		topicID = msg.ID
+	}
+
+	if topicID != 0 {
+		// Fetch the real topic object so all fields (Closed, Hidden, etc.) are populated.
+		topics, fetchErr := c.getTopicsByIDs(ctx, params.ChannelID, []int{topicID})
+		if fetchErr == nil && len(topics) > 0 {
+			return topics[0], nil
+		}
+	}
+
+	return &Topic{
+		ID:          topicID,
+		Title:       params.Title,
+		IconEmojiID: params.IconEmojiID,
+	}, nil
 }
 
 // GetTopicsParams holds parameters for retrieving forum topics.

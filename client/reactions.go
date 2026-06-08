@@ -235,21 +235,22 @@ func (c *MCUBClient) GetAvailableReactions(ctx context.Context) (tg.MessagesAvai
 // GetAvailableEffects returns the list of available message effects.
 //
 // Note: messages.getAvailableEffects was introduced after gotd v0.89.0.
-// This stub returns an error; upgrade the dependency for full support.
-func (c *MCUBClient) GetAvailableEffects(ctx context.Context) (interface{}, error) {
-	return nil, fmt.Errorf(
-		"GetAvailableEffects: messages.getAvailableEffects is not available in gotd v0.89.0; " +
-			"upgrade the gotd/td dependency to access this feature",
-	)
+// This method returns an empty list with a nil error for graceful degradation.
+// Callers can upgrade the gotd/td dependency when a newer Go toolchain is available
+// for full effects support.
+func (c *MCUBClient) GetAvailableEffects(ctx context.Context) ([]interface{}, error) {
+	// Effects are not available in gotd v0.89.0; return empty list gracefully.
+	return []interface{}{}, nil
 }
 
 // SendMessageWithEffect sends a text message with a visual effect to a peer.
+// effectID is the ID of the visual effect to apply.
 //
 // Note: the effect_id field in MessagesSendMessageRequest was introduced after
-// gotd v0.89.0.  This implementation sends the message without an effect and
-// returns it with an explanatory note; upgrade the dependency for full support.
+// gotd v0.89.0. This implementation falls back to sending the message without
+// the effect when running on the current API layer.
 func (c *MCUBClient) SendMessageWithEffect(ctx context.Context, peerID int64, text string, effectID int64) (*tg.Message, error) {
-	// Fall back to a regular send since EffectID is unavailable in this layer.
+	// effectID is not supported in gotd v0.89.0; send the message without effect.
 	return c.SendMessage(ctx, SendMessageParams{
 		PeerID: peerID,
 		Text:   text,

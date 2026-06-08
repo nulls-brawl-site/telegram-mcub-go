@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/gotd/td/tg"
 )
@@ -984,4 +986,235 @@ func FromTLMessage(m *tg.Message) *Message {
 	}
 
 	return msg
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: Missing methods ported from Telethon's custom Message class
+// ---------------------------------------------------------------------------
+
+// GetEntityText returns the text slice corresponding to a specific MessageEntity.
+// Offsets and lengths in Telegram entities are measured in UTF-16 code units.
+func (m *MCUBMessage) GetEntityText(entity tg.MessageEntityClass) string {
+	if m.Raw == nil || entity == nil {
+		return ""
+	}
+	text := m.Raw.Message
+	if text == "" {
+		return ""
+	}
+
+	type offsetLengther interface {
+		GetOffset() int
+		GetLength() int
+	}
+	ol, ok := entity.(offsetLengther)
+	if !ok {
+		return ""
+	}
+	offset := ol.GetOffset()
+	length := ol.GetLength()
+
+	// Convert UTF-16 offset/length to rune positions.
+	utf16Units := utf16.Encode([]rune(text))
+	end := offset + length
+	if offset < 0 || end > len(utf16Units) {
+		return ""
+	}
+	slice := utf16Units[offset:end]
+	return string(utf16.Decode(slice))
+}
+
+// HasMention reports whether the message contains at least one user mention entity.
+func (m *MCUBMessage) HasMention() bool {
+	if m.Raw == nil {
+		return false
+	}
+	for _, e := range m.Raw.Entities {
+		switch e.(type) {
+		case *tg.MessageEntityMention, *tg.MessageEntityMentionName:
+			return true
+		}
+	}
+	return false
+}
+
+// HasHashtag reports whether the message contains at least one hashtag entity.
+func (m *MCUBMessage) HasHashtag() bool {
+	if m.Raw == nil {
+		return false
+	}
+	for _, e := range m.Raw.Entities {
+		if _, ok := e.(*tg.MessageEntityHashtag); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// HasBotCommand reports whether the message contains at least one bot command entity.
+func (m *MCUBMessage) HasBotCommand() bool {
+	if m.Raw == nil {
+		return false
+	}
+	for _, e := range m.Raw.Entities {
+		if _, ok := e.(*tg.MessageEntityBotCommand); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ParsedText returns the message text with HTML formatting applied.
+// Bold → <b>…</b>, italic → <i>…</i>, code → <code>…</code>, etc.
+// Entities are resolved left-to-right and nested tags are not merged.
+func (m *MCUBMessage) ParsedText() string {
+	if m.Raw == nil {
+		return ""
+	}
+	text := m.Raw.Message
+	if len(m.Raw.Entities) == 0 {
+		return text
+	}
+
+	// Work in UTF-16 code units to match entity offsets.
+	utf16Units := utf16.Encode([]rune(text))
+
+	type span struct {
+		start, end int
+		open, close string
+	}
+
+	spans := make([]span, 0, len(m.Raw.Entities))
+	for _, e := range m.Raw.Entities {
+		type ol interface {
+			GetOffset() int
+			GetLength() int
+		}
+		olv, ok := e.(ol)
+		if !ok {
+			continue
+		}
+		off := olv.GetOffset()
+		ln := olv.GetLength()
+		end := off + ln
+		if off < 0 || end > len(utf16Units) {
+			continue
+		}
+		var open, close string
+		switch e.(type) {
+		case *tg.MessageEntityBold:
+			open, close = "<b>", "</b>"
+		case *tg.MessageEntityItalic:
+			open, close = "<i>", "</i>"
+		case *tg.MessageEntityCode:
+			open, close = "<code>", "</code>"
+		case *tg.MessageEntityPre:
+			open, close = "<pre>", "</pre>"
+		case *tg.MessageEntityUnderline:
+			open, close = "<u>", "</u>"
+		case *tg.MessageEntityStrike:
+			open, close = "<s>", "</s>"
+		case *tg.MessageEntitySpoiler:
+			open, close = "<span class=\"spoiler\">", "</span>"
+		default:
+			continue
+		}
+		spans = append(spans, span{off, end, open, close})
+	}
+
+	if len(spans) == 0 {
+		return text
+	}
+
+	var sb strings.Builder
+	pos := 0
+	// Simple greedy insertion — does not handle overlapping entities.
+	for _, sp := range spans {
+		if sp.start > pos {
+			sb.WriteString(string(utf16.Decode(utf16Units[pos:sp.start])))
+		}
+		sb.WriteString(sp.open)
+		sb.WriteString(string(utf16.Decode(utf16Units[sp.start:sp.end])))
+		sb.WriteString(sp.close)
+		pos = sp.end
+	}
+	if pos < len(utf16Units) {
+		sb.WriteString(string(utf16.Decode(utf16Units[pos:])))
+	}
+	return sb.String()
+}
+
+// LengthInUTF16 returns the length of the message text in UTF-16 code units.
+// This matches the unit used by Telegram for entity offset and length fields.
+func (m *MCUBMessage) LengthInUTF16() int {
+	if m.Raw == nil {
+		return 0
+	}
+	n := 0
+	for _, r := range m.Raw.Message {
+		if r >= 0x10000 {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// MediaType returns a human-readable string describing the media type.
+// Possible values: "photo", "video", "video_note", "audio", "voice",
+// "sticker", "gif", "document", "contact", "location", "venue", "poll",
+// "dice", "game", "web_preview", or "" for text-only messages.
+func (m *MCUBMessage) MediaType() string {
+	if !m.HasMedia() {
+		return ""
+	}
+	switch m.Raw.Media.(type) {
+	case *tg.MessageMediaPhoto:
+		return "photo"
+	case *tg.MessageMediaContact:
+		return "contact"
+	case *tg.MessageMediaGeo, *tg.MessageMediaGeoLive:
+		return "location"
+	case *tg.MessageMediaVenue:
+		return "venue"
+	case *tg.MessageMediaPoll:
+		return "poll"
+	case *tg.MessageMediaDice:
+		return "dice"
+	case *tg.MessageMediaGame:
+		return "game"
+	case *tg.MessageMediaWebPage:
+		return "web_preview"
+	case *tg.MessageMediaDocument:
+		// Inspect document attributes for a more specific type.
+		mmd, ok := m.Raw.Media.(*tg.MessageMediaDocument)
+		if !ok {
+			return "document"
+		}
+		doc, ok := mmd.Document.(*tg.Document)
+		if !ok {
+			return "document"
+		}
+		for _, attr := range doc.Attributes {
+			switch a := attr.(type) {
+			case *tg.DocumentAttributeVideo:
+				if a.RoundMessage {
+					return "video_note"
+				}
+				return "video"
+			case *tg.DocumentAttributeAudio:
+				if a.Voice {
+					return "voice"
+				}
+				return "audio"
+			case *tg.DocumentAttributeSticker:
+				return "sticker"
+			case *tg.DocumentAttributeAnimated:
+				return "gif"
+			}
+		}
+		return "document"
+	}
+	return ""
 }
